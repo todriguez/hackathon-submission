@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Semantos CellToken Poker — Live Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0a0a0f; color: #e0e0e0; }
+  h1 { text-align: center; padding: 16px; background: linear-gradient(90deg, #1a1a2e, #16213e);
+       border-bottom: 2px solid #0f3460; font-size: 1.4em; letter-spacing: 2px; }
+  h1 span { color: #00d4ff; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px; padding: 12px; }
+  .card { background: #12121f; border: 1px solid #1e1e3a; border-radius: 8px; padding: 16px; }
+  .card h2 { font-size: 0.9em; color: #7b7baa; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;
+             border-bottom: 1px solid #1e1e3a; padding-bottom: 6px; }
+  .stat { display: flex; justify-content: space-between; padding: 4px 0; }
+  .stat .label { color: #888; }
+  .stat .value { color: #00d4ff; font-weight: bold; }
+  .stat .value.green { color: #00ff88; }
+  .stat .value.red { color: #ff4444; }
+  .stat .value.gold { color: #ffd700; }
+  .stat .value.purple { color: #b388ff; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+  th { text-align: left; color: #7b7baa; padding: 4px 8px; border-bottom: 1px solid #1e1e3a; }
+  td { padding: 4px 8px; border-bottom: 1px solid #0e0e1a; }
+  tr:hover { background: #1a1a2e; }
+  .badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; }
+  .badge.caught { background: #004d1a; color: #00ff88; }
+  .badge.undetected { background: #4d0000; color: #ff4444; }
+  .badge.linear { background: #003366; color: #00aaff; }
+  .badge.premium { background: #4d3300; color: #ffd700; }
+  .txid { font-size: 0.7em; color: #666; cursor: pointer; }
+  .txid:hover { color: #00d4ff; text-decoration: underline; }
+  .ws-status { position: fixed; top: 8px; right: 16px; font-size: 0.7em; }
+  .ws-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  .ws-dot.connected { background: #00ff88; }
+  .ws-dot.disconnected { background: #ff4444; }
+  .policy-lisp { font-family: monospace; font-size: 0.75em; color: #b388ff; background: #1a1a2e;
+                 padding: 4px 8px; border-radius: 3px; margin-top: 4px; display: block; white-space: pre-wrap; }
+  .refresh-bar { text-align: center; font-size: 0.7em; color: #444; padding: 4px; }
+  .empty { color: #444; font-style: italic; padding: 8px; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1><span>SEMANTOS</span> CellToken Poker &mdash; Live Dashboard</h1>
+<div class="ws-status"><span class="ws-dot disconnected" id="ws-dot"></span><span id="ws-label">Connecting...</span></div>
+
+<div class="grid">
+  <!-- Stats Overview -->
+  <div class="card">
+    <h2>System Stats</h2>
+    <div id="stats">
+      <div class="stat"><span class="label">Hands Played</span><span class="value" id="s-hands">—</span></div>
+      <div class="stat"><span class="label">On-Chain Txs</span><span class="value green" id="s-txs">—</span></div>
+      <div class="stat"><span class="label">CellTokens</span><span class="value" id="s-cells">—</span></div>
+      <div class="stat"><span class="label">Tx/sec</span><span class="value" id="s-tps">—</span></div>
+      <div class="stat"><span class="label">Hands/sec</span><span class="value" id="s-hps">—</span></div>
+      <div class="stat"><span class="label">Uptime</span><span class="value" id="s-uptime">—</span></div>
+      <div class="stat"><span class="label">Eliminations</span><span class="value red" id="s-elim">—</span></div>
+      <div class="stat"><span class="label">Unique Players</span><span class="value" id="s-players">—</span></div>
+      <div class="stat"><span class="label">Est. Fee Spend</span><span class="value gold" id="s-fees">—</span></div>
+    </div>
+  </div>
+
+  <!-- CellToken Overlay Stats -->
+  <div class="card">
+    <h2>CellToken Overlay</h2>
+    <div id="cell-stats">
+      <div class="stat"><span class="label">Total Cells</span><span class="value" id="c-total">—</span></div>
+      <div class="stat"><span class="label">By Phase</span><span class="value" id="c-phases">—</span></div>
+      <div class="stat"><span class="label">Avg Size (bytes)</span><span class="value" id="c-avgsize">—</span></div>
+      <div class="stat"><span class="label">Avg Fee (sats)</span><span class="value" id="c-avgfee">—</span></div>
+      <div class="stat"><span class="label">Total Fee (sats)</span><span class="value gold" id="c-totalfee">—</span></div>
+      <div class="stat"><span class="label">Unique Hands</span><span class="value" id="c-hands">—</span></div>
+      <div class="stat"><span class="label">Sources</span><span class="value" id="c-sources">—</span></div>
+    </div>
+  </div>
+
+  <!-- Apex Predators -->
+  <div class="card">
+    <h2>Apex Predators</h2>
+    <div id="apex-stats"><div class="empty">Waiting for apex agents...</div></div>
+  </div>
+
+  <!-- Policy Evolution -->
+  <div class="card">
+    <h2>Policy Evolution</h2>
+    <div id="policies"><div class="empty">No policy upgrades yet...</div></div>
+  </div>
+
+  <!-- Cheat Attempts -->
+  <div class="card">
+    <h2>Cheat Attempts (Rogue Agent)</h2>
+    <div id="cheats"><div class="empty">No cheat attempts yet...</div></div>
+  </div>
+
+  <!-- Premium Hands -->
+  <div class="card">
+    <h2>Premium Hands</h2>
+    <div id="premium"><div class="empty">No premium hands yet...</div></div>
+  </div>
+
+  <!-- Agent vs Agent -->
+  <div class="card">
+    <h2>Agent vs Agent Matchups</h2>
+    <div id="matchups"><div class="empty">No agent matchups yet...</div></div>
+  </div>
+
+  <!-- Settlements -->
+  <div class="card">
+    <h2>Apex Settlements</h2>
+    <div id="settlements"><div class="empty">No settlements yet...</div></div>
+  </div>
+
+  <!-- Live Tx DAG -->
+  <div class="card">
+    <h2>Transaction DAG (Latest)</h2>
+    <div id="tx-dag"><div class="empty">No CellToken chains yet...</div></div>
+  </div>
+
+  <!-- Active Tables -->
+  <div class="card">
+    <h2>Active Tables</h2>
+    <div id="tables"><div class="empty">No tables reporting yet...</div></div>
+  </div>
+</div>
+
+<div class="refresh-bar">Auto-refreshes every 2s | WebSocket for live events</div>
+
+<script>
+const BASE = location.origin;
+const WS_URL = `ws://${location.host}/ws`;
+
+// ── WebSocket ──
+let ws;
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    document.getElementById('ws-dot').className = 'ws-dot connected';
+    document.getElementById('ws-label').textContent = 'Live';
+  };
+  ws.onclose = () => {
+    document.getElementById('ws-dot').className = 'ws-dot disconnected';
+    document.getElementById('ws-label').textContent = 'Reconnecting...';
+    setTimeout(connectWS, 3000);
+  };
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      handleWSEvent(msg);
+    } catch {}
+  };
+}
+connectWS();
+
+function handleWSEvent(msg) {
+  // Refresh on any event
+  refresh();
+}
+
+// ── Helpers ──
+function fmt(n) { return n != null ? Number(n).toLocaleString() : '—'; }
+function fmtSats(n) { return n != null ? `${fmt(n)} sats` : '—'; }
+function fmtBSV(sats) { return sats != null ? `${(sats / 1e8).toFixed(4)} BSV` : '—'; }
+function fmtTime(ms) {
+  if (!ms) return '—';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s/60)}m ${s%60}s`;
+  return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+}
+function txLink(txid) {
+  if (!txid || txid.startsWith('stub_') || txid.startsWith('shadow_')) return `<span class="txid">${txid?.slice(0,16) ?? '—'}...</span>`;
+  return `<a class="txid" href="https://whatsonchain.com/tx/${txid}" target="_blank">${txid.slice(0,16)}...</a>`;
+}
+
+// ── Data fetchers ──
+async function fetchJSON(path) {
+  try { const r = await fetch(BASE + path); return r.ok ? await r.json() : null; } catch { return null; }
+}
+
+async function refreshStats() {
+  const d = await fetchJSON('/api/stats');
+  if (!d) return;
+  document.getElementById('s-hands').textContent = fmt(d.totalHands);
+  document.getElementById('s-txs').textContent = fmt(d.totalTxCount);
+  document.getElementById('s-elim').textContent = fmt(d.totalEliminations);
+  document.getElementById('s-players').textContent = fmt(d.totalUniquePlayers);
+  const uptime = d.uptimeMs || (Date.now() - d.startTime);
+  document.getElementById('s-uptime').textContent = fmtTime(uptime);
+  const secs = (uptime || 1) / 1000;
+  document.getElementById('s-tps').textContent = (d.totalTxCount / secs).toFixed(1);
+  document.getElementById('s-hps').textContent = (d.totalHands / secs).toFixed(1);
+}
+
+async function refreshCellStats() {
+  const d = await fetchJSON('/api/cells/stats');
+  if (!d) return;
+  document.getElementById('c-total').textContent = fmt(d.totalCells);
+  document.getElementById('c-avgsize').textContent = fmt(d.avgEstimatedBytes);
+  document.getElementById('c-avgfee').textContent = fmt(d.avgEstimatedFeeSats);
+  document.getElementById('c-totalfee').textContent = fmtSats(d.totalEstimatedFeeSats);
+  document.getElementById('c-hands').textContent = fmt(d.uniqueHands);
+  document.getElementById('c-sources').textContent = fmt(d.uniqueSources);
+  document.getElementById('s-cells').textContent = fmt(d.totalCells);
+  document.getElementById('s-fees').textContent = fmtBSV(d.totalEstimatedFeeSats);
+
+  if (d.phaseBreakdown) {
+    const phases = Object.entries(d.phaseBreakdown).map(([k,v]) => `${k}:${v}`).join(' ');
+    document.getElementById('c-phases').textContent = phases;
+  }
+}
+
+async function refreshCheats() {
+  const d = await fetchJSON('/api/cheat-attempts');
+  if (!d || !d.attempts?.length) return;
+  const el = document.getElementById('cheats');
+  el.innerHTML = `<table><tr><th>Type</th><th>Status</th><th>Caught By</th><th>Hand</th></tr>` +
+    d.attempts.slice(-15).reverse().map(c =>
+      `<tr><td>${c.type}</td><td><span class="badge ${c.caught ? 'caught' : 'undetected'}">${c.caught ? 'CAUGHT' : 'UNDETECTED'}</span></td><td>${c.caughtBy || '—'}</td><td>#${c.handNumber}</td></tr>`
+    ).join('') + `</table>` +
+    `<div class="stat" style="margin-top:8px"><span class="label">Total</span><span class="value">${d.total}</span></div>` +
+    `<div class="stat"><span class="label">Caught</span><span class="value green">${d.caught}</span></div>` +
+    `<div class="stat"><span class="label">Undetected</span><span class="value red">${d.undetected}</span></div>`;
+}
+
+async function refreshPremium() {
+  const d = await fetchJSON('/api/premium-hands');
+  if (!d?.length) return;
+  const el = document.getElementById('premium');
+  el.innerHTML = `<table><tr><th>Rank</th><th>Player</th><th>Cards</th><th>Pot</th></tr>` +
+    d.slice(-10).reverse().map(h =>
+      `<tr><td><span class="badge premium">${h.handRank}</span></td><td>${h.playerId.slice(0,12)}</td><td>${h.cards || '—'}</td><td>${fmt(h.pot)}</td></tr>`
+    ).join('') + `</table>`;
+}
+
+async function refreshMatchups() {
+  const d = await fetchJSON('/api/agent-matchups');
+  if (!d?.matchups?.length) return;
+  const el = document.getElementById('matchups');
+  el.innerHTML = `<table><tr><th>Agent 1</th><th>Agent 2</th><th>Winner</th><th>Pot</th></tr>` +
+    d.matchups.slice(-10).reverse().map(m =>
+      `<tr><td>${m.agent1Model || m.agent1.slice(0,10)}</td><td>${m.agent2Model || m.agent2.slice(0,10)}</td>` +
+      `<td style="color:${m.winner===m.agent1 ? '#00d4ff' : '#ff88aa'}">${m.winner === m.agent1 ? 'A1' : 'A2'}</td><td>${fmt(m.pot)}</td></tr>`
+    ).join('') + `</table>` +
+    (d.headToHead ? `<div style="margin-top:8px; font-size:0.8em; color:#888">${Object.entries(d.headToHead).map(([k,v]) => `${k}: ${v.wins}W/${v.losses}L`).join(' | ')}</div>` : '');
+}
+
+async function refreshPolicies() {
+  const d = await fetchJSON('/api/policy-summary');
+  if (!d) return;
+  const el = document.getElementById('policies');
+  if (!d.bots?.length) return;
+  el.innerHTML = d.bots.map(b =>
+    `<div style="margin-bottom:12px">` +
+    `<div class="stat"><span class="label">${b.botId}</span><span class="value purple">v${b.latestVersion}</span></div>` +
+    `<div class="stat"><span class="label">Upgrades</span><span class="value">${b.totalVersions}</span></div>` +
+    (b.latestLisp ? `<code class="policy-lisp">${b.latestLisp.slice(0, 200)}</code>` : '') +
+    `</div>`
+  ).join('');
+}
+
+async function refreshSettlements() {
+  const d = await fetchJSON('/api/settlements');
+  if (!d?.length) return;
+  const el = document.getElementById('settlements');
+  el.innerHTML = `<table><tr><th>Apex</th><th>Table</th><th>Chips Won</th><th>Hands</th><th>Txids</th></tr>` +
+    d.slice(-10).reverse().map(s =>
+      `<tr><td>${s.apexId?.slice(0,10) || '—'}</td><td>${s.tableId?.slice(0,10) || '—'}</td>` +
+      `<td style="color:${s.chipsWon >= 0 ? '#00ff88' : '#ff4444'}">${s.chipsWon > 0 ? '+' : ''}${fmt(s.chipsWon)}</td>` +
+      `<td>${fmt(s.handsPlayed)}</td><td>${s.broadcastTxids?.length ? txLink(s.broadcastTxids[0]) : '—'}</td></tr>`
+    ).join('') + `</table>`;
+}
+
+async function refreshTxDag() {
+  const d = await fetchJSON('/api/tx-dag?limit=5');
+  if (!d?.chains?.length) return;
+  const el = document.getElementById('tx-dag');
+  el.innerHTML = d.chains.map(chain =>
+    `<div style="margin-bottom:8px; padding:4px; background:#0e0e1a; border-radius:4px">` +
+    `<div style="font-size:0.75em; color:#7b7baa">${chain.handId?.slice(0,20) || 'chain'} (${chain.cells?.length || 0} cells)</div>` +
+    `<div style="font-size:0.7em; margin-top:4px">` +
+    (chain.cells || []).map(c =>
+      `<span class="badge linear">${c.phase}</span> `
+    ).join('→ ') +
+    `</div></div>`
+  ).join('');
+}
+
+async function refreshTables() {
+  const d = await fetchJSON('/api/tables');
+  if (!d?.tables?.length) return;
+  const el = document.getElementById('tables');
+  el.innerHTML = `<table><tr><th>Table</th><th>Players</th><th>Hands</th><th>Avg Chips</th></tr>` +
+    d.tables.slice(0, 20).map(t =>
+      `<tr><td>${t.tableId?.slice(0,12) || '—'}</td><td>${t.playerCount || '—'}</td><td>${fmt(t.handsPlayed)}</td><td>${fmt(t.avgChips)}</td></tr>`
+    ).join('') + `</table>`;
+}
+
+async function refreshApex() {
+  const d = await fetchJSON('/api/stats');
+  if (!d?.apexRebuys) return;
+  const el = document.getElementById('apex-stats');
+  const entries = Object.entries(d.apexRebuys);
+  if (!entries.length) return;
+  el.innerHTML = entries.map(([id, info]) =>
+    `<div style="margin-bottom:8px">` +
+    `<div class="stat"><span class="label">${id}</span><span class="value purple">${info.model || 'unknown'}</span></div>` +
+    `<div class="stat"><span class="label">Rebuys</span><span class="value">${info.count}</span></div>` +
+    `<div class="stat"><span class="label">Cost</span><span class="value gold">${fmtSats(info.costSats)}</span></div>` +
+    `</div>`
+  ).join('');
+}
+
+// ── Refresh loop ──
+async function refresh() {
+  await Promise.all([
+    refreshStats(),
+    refreshCellStats(),
+    refreshCheats(),
+    refreshPremium(),
+    refreshMatchups(),
+    refreshPolicies(),
+    refreshSettlements(),
+    refreshTxDag(),
+    refreshTables(),
+    refreshApex(),
+  ]);
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

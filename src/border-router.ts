@@ -413,7 +413,7 @@ console.log(`[BorderRouter] Starting on ports ${METRICS_PORT} (HTTP) and ${WS_PO
 // Main HTTP + WS server on METRICS_PORT
 const server = Bun.serve({
   port: METRICS_PORT,
-  fetch(req, server) {
+  async fetch(req, server) {
     const url = new URL(req.url);
 
     // WebSocket upgrade
@@ -437,6 +437,19 @@ const server = Bun.serve({
     }
 
     // ── Routes ──
+
+    // GET / — serve dashboard
+    if (url.pathname === '/' || url.pathname === '/dashboard') {
+      const dashboardPath = new URL('./dashboard.html', import.meta.url).pathname;
+      try {
+        const html = await Bun.file(dashboardPath).text();
+        return new Response(html, { headers: { ...corsHeaders, 'Content-Type': 'text/html; charset=utf-8' } });
+      } catch {
+        return new Response('<h1>Dashboard not found</h1><p>Looking for: ' + dashboardPath + '</p>', {
+          status: 404, headers: { 'Content-Type': 'text/html' },
+        });
+      }
+    }
 
     // GET /health
     if (url.pathname === '/health') {
