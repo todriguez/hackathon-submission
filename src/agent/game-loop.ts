@@ -28,9 +28,7 @@ import type { WalletClient } from '../protocol/wallet-client';
 import { PokerStateMachine } from './poker-state-machine';
 import type { HandStatePayload, PokerPhase, AnchorResult } from './poker-state-machine';
 import type { DirectPokerStateMachine } from './direct-poker-state-machine';
-// PaymentChannelManager excluded — requires metering package
-type PaymentChannelManager = any;
-type ChannelInstance = any;
+import { PaymentChannelManager, type ChannelInstance } from './payment-channel';
 import { createHash } from 'crypto';
 import type { GameLoopHandle } from './shadow-loop-types';
 

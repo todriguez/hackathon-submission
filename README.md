@@ -16,6 +16,8 @@ This is **not** a poker game. Poker is the data generator — a high-churn envir
 
 5. **Kernel-enforced cheat detection** — a rogue agent runs 5 exploit classes against the system. The 2PDA kernel validates every state transition and catches invalid moves. Cheat attempts are logged as CellTokens — the detection itself is on-chain evidence.
 
+6. **On-chain payment channels with auditable tick proofs** — each bet between agents operates inside a 2-of-2 multisig payment channel. Every betting increment emits a CellToken transition (v_n → v_{n+1}) on-chain, kernel-validated with HMAC-SHA256 tick proofs. The internal channel mechanism is fully auditable — you can trace every satoshi movement through the channel's CellToken state chain. Settlement closes the multisig with nSequence encoding the final state version.
+
 ## Why This Matters
 
 Current AI systems learn from opaque datasets and deploy policies with no audit trail. You can't verify what data trained a model, what reasoning produced a decision, or whether the outcome was legitimate.
@@ -70,6 +72,21 @@ Every arrow is auditable. Every CellToken is on BSV mainnet. Every policy versio
 │    8. Record policy CellToken with training data refs           │
 │    9. Play with new policy, measure results                     │
 │   10. Settle → next roam → repeat                               │
+│                                                                 │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────────┐
+│                    PAYMENT CHANNEL LAYER                         │
+│                                                                 │
+│  2-of-2 multisig channels between competing agents              │
+│  Each bet = a CellToken transition (v_n → v_{n+1})              │
+│  HMAC-SHA256 tick proofs authenticate every state update         │
+│  8-state FSM: NEGOTIATE → FUND → ACTIVE → CLOSE → SETTLE       │
+│  Settlement: nSequence encodes final kernel-validated version    │
+│  Violations: AFFINE CellTokens + per-offender watchlist chains  │
+│                                                                 │
+│  The internal channel state is fully on-chain — every sat        │
+│  movement is a kernel-validated, hash-chained CellToken.         │
 │                                                                 │
 └──────────────────────┬──────────────────────────────────────────┘
                        │

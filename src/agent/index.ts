@@ -20,7 +20,8 @@ export { P2PAgentRunner } from './p2p-agent-runner';
 export type { P2PAgentConfig, P2PHandResult } from './p2p-agent-runner';
 export { AgentDiscoveryService } from './agent-discovery';
 export type { AgentProfile, MatchResult } from './agent-discovery';
-// PaymentChannelManager excluded — requires metering package (available in semantos-core)
+export { PaymentChannelManager, ChannelViolationError } from './payment-channel';
+export type { ChannelConfig, ChannelInstance, ChannelEvent, WatchlistInstance, TamperMode } from './payment-channel';
 
 // Phase H4: Apex Agent Shadow Loop
 export { ShadowLoop } from './shadow-loop';
