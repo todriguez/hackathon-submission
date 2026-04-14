@@ -125,6 +125,24 @@
     <div id="tx-dag"><div class="empty">No CellToken chains yet...</div></div>
   </div>
 
+  <!-- Swarm EMA Adaptation -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Swarm EMA Adaptation — Heuristic Bots Learning</h2>
+    <p style="font-size:0.75em; color:#666; margin-bottom:8px;">Each floor bot adapts its play style via exponential moving average. Losing bots tighten up, winning bots loosen. This creates a negative feedback loop that stabilises the swarm.</p>
+    <div id="swarm-ema"><div class="empty">Waiting for swarm EMA data...</div></div>
+  </div>
+
+  <!-- Paskian Observations -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Paskian Observations — Detected Behavioral Patterns</h2>
+    <p style="font-size:0.75em; color:#666; margin-bottom:8px;">Paskian watches the swarm EMA data and detects convergence/divergence patterns. Stable threads = converged behaviors. Emerging threads = trends forming.</p>
+    <div id="paskian-stable"><div class="empty">No stable patterns detected yet...</div></div>
+    <div style="margin-top:12px">
+      <h3 style="font-size:0.8em; color:#7b7baa; margin-bottom:6px;">Emerging Patterns</h3>
+      <div id="paskian-emerging"><div class="empty">No emerging patterns yet...</div></div>
+    </div>
+  </div>
+
   <!-- Active Tables -->
   <div class="card">
     <h2>Active Tables</h2>
@@ -331,6 +349,83 @@ async function refreshApex() {
   ).join('');
 }
 
+async function refreshSwarmEMA() {
+  const d = await fetchJSON('/api/swarm-ema');
+  if (!d || !d.totalPlayers) return;
+  const el = document.getElementById('swarm-ema');
+
+  // Persona convergence table
+  const personas = Object.entries(d.byPersona || {});
+  if (personas.length === 0) return;
+
+  let html = `<div class="stat"><span class="label">Tracked Players</span><span class="value">${fmt(d.totalPlayers)}</span></div>`;
+  html += `<div class="stat"><span class="label">EMA Updates</span><span class="value">${fmt(d.swarmUpdates)}</span></div>`;
+  html += `<table style="margin-top:8px"><tr><th>Persona</th><th>Count</th><th>Avg Win Rate</th><th>Avg Chip Delta</th><th>Status</th></tr>`;
+
+  for (const [persona, stats] of personas) {
+    const wr = stats.avgWinRate;
+    const cd = stats.avgChipDelta;
+    const status = wr > 0.30 ? '<span style="color:#00ff88">Thriving</span>' :
+                   wr < 0.20 ? '<span style="color:#ff4444">Struggling</span>' :
+                   '<span style="color:#888">Stable</span>';
+    html += `<tr><td>${persona}</td><td>${stats.count}</td>` +
+            `<td style="color:${wr > 0.25 ? '#00ff88' : '#ff4444'}">${(wr * 100).toFixed(1)}%</td>` +
+            `<td style="color:${cd >= 0 ? '#00ff88' : '#ff4444'}">${cd >= 0 ? '+' : ''}${cd.toFixed(1)}</td>` +
+            `<td>${status}</td></tr>`;
+  }
+  html += '</table>';
+
+  // Show a few individual players with extreme EMAs
+  if (d.players?.length > 0) {
+    const sorted = d.players.slice().sort((a, b) => b.ema.emaChipDelta - a.ema.emaChipDelta);
+    const top3 = sorted.slice(0, 3);
+    const bottom3 = sorted.slice(-3).reverse();
+    html += `<div style="margin-top:12px; font-size:0.8em;">`;
+    html += `<span style="color:#7b7baa">Top performers:</span> `;
+    html += top3.map(p => `<span style="color:#00ff88">${p.persona} (${p.ema.emaChipDelta >= 0 ? '+' : ''}${p.ema.emaChipDelta.toFixed(1)}/hand, ${(p.ema.emaWinRate*100).toFixed(0)}% WR)</span>`).join(', ');
+    html += `<br><span style="color:#7b7baa">Bottom performers:</span> `;
+    html += bottom3.map(p => `<span style="color:#ff4444">${p.persona} (${p.ema.emaChipDelta >= 0 ? '+' : ''}${p.ema.emaChipDelta.toFixed(1)}/hand, ${(p.ema.emaWinRate*100).toFixed(0)}% WR)</span>`).join(', ');
+    html += `</div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+async function refreshPaskian() {
+  const [stable, emerging] = await Promise.all([
+    fetchJSON('/api/paskian/stable-threads'),
+    fetchJSON('/api/paskian/emerging-threads'),
+  ]);
+
+  const stableEl = document.getElementById('paskian-stable');
+  if (stable?.length > 0) {
+    stableEl.innerHTML = stable.map(t =>
+      `<div style="margin-bottom:12px; padding:8px; background:#0a1a0a; border-left:3px solid #00ff88; border-radius:4px;">` +
+      `<div style="font-size:0.85em; color:#00ff88; font-weight:bold;">${t.label}</div>` +
+      `<div style="font-size:0.8em; color:#ccc; margin-top:4px;">${t.observation}</div>` +
+      `<div style="font-size:0.7em; color:#666; margin-top:4px;">` +
+      `Stability: ${(t.stability * 100).toFixed(0)}% | Nodes: ${t.nodes.length} | Interactions: ${fmt(t.interactions)}` +
+      `</div></div>`
+    ).join('');
+  } else {
+    stableEl.innerHTML = '<div class="empty">No stable patterns detected yet (need ~50+ hands per player)...</div>';
+  }
+
+  const emergingEl = document.getElementById('paskian-emerging');
+  if (emerging?.length > 0) {
+    emergingEl.innerHTML = emerging.map(t =>
+      `<div style="margin-bottom:12px; padding:8px; background:#1a1a0a; border-left:3px solid #ffd700; border-radius:4px;">` +
+      `<div style="font-size:0.85em; color:#ffd700; font-weight:bold;">${t.label}</div>` +
+      `<div style="font-size:0.8em; color:#ccc; margin-top:4px;">${t.observation}</div>` +
+      `<div style="font-size:0.7em; color:#666; margin-top:4px;">` +
+      `Stability: ${(t.stability * 100).toFixed(0)}% | Nodes: ${t.nodes.length} | Interactions: ${fmt(t.interactions)}` +
+      `</div></div>`
+    ).join('');
+  } else {
+    emergingEl.innerHTML = '<div class="empty">No emerging patterns yet...</div>';
+  }
+}
+
 async function refreshExportStats() {
   const d = await fetchJSON('/api/cells/export/stats');
   if (!d) return;
@@ -355,6 +450,8 @@ async function refresh() {
     refreshTxDag(),
     refreshTables(),
     refreshApex(),
+    refreshSwarmEMA(),
+    refreshPaskian(),
     refreshExportStats(),
   ]);
 }
