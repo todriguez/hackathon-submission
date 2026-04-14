@@ -1,0 +1,282 @@
+# Docker Compose — Semantos CellToken Poker Hackathon
+#
+# Architecture:
+#   8 floor nodes (heuristic poker bots, CellToken broadcasting)
+#   5 apex predators (AI hunters + rogue agent)
+#   1 border router (metrics API)
+#
+# Each hand generates ~5 CellTokens on BSV mainnet.
+# All txids logged to /audit/ for hackathon submission.
+#
+# Usage:
+#   # Dry run (stub mode, no BSV):
+#   docker compose up -d
+#
+#   # Live on-chain:
+#   source .env.live
+#   docker compose up -d
+#
+#   # Monitor:
+#   curl http://localhost:9090/api/stats | jq .
+
+# ── Shared base for floor nodes ──
+
+x-floor-base: &floor-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  entrypoint: ["bun", "run", "src/entrypoint-floor.ts"]
+  networks:
+    - casino-mesh
+  init: true
+  restart: ${FLOOR_RESTART:-always}
+  volumes:
+    - audit-logs:/audit:rw
+  depends_on:
+    router:
+      condition: service_started
+
+x-floor-env: &floor-env
+  TABLES_PER_NODE: ${TABLES_PER_NODE:-16}
+  SEATS_PER_TABLE: ${SEATS_PER_TABLE:-2}
+  HANDS_PER_TABLE: ${HANDS_PER_TABLE:-2000}
+  HAND_DELAY_MS: ${HAND_DELAY_MS:-0}
+  ACTION_DELAY_MS: ${ACTION_DELAY_MS:-0}
+  ROUTER_URL: http://router:9090
+  ANCHOR_MODE: ${ANCHOR_MODE:-stub}
+  STARTING_CHIPS: ${STARTING_CHIPS:-1000}
+  SMALL_BLIND: "5"
+  BIG_BLIND: "10"
+  FEE_RATE: ${FEE_RATE:-0.1}
+  MIN_FEE: ${MIN_FEE:-135}
+  SPLIT_SATS: ${SPLIT_SATS:-2000}
+  ELIMINATION_MODE: ${ELIMINATION_MODE:-true}
+  PRIVATE_KEY_WIF: ${PRIVATE_KEY_WIF:-}
+  CHANGE_ADDRESS: ${CHANGE_ADDRESS:-}
+  FUNDING_TX_HEX: ${FUNDING_TX_HEX:-}
+  AUDIT_LOG_DIR: /audit
+
+# ── Shared base for apex predators ──
+
+x-apex-base: &apex-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  entrypoint: ["bun", "run", "src/entrypoint-apex.ts"]
+  networks:
+    - casino-mesh
+  init: true
+  restart: "no"
+  volumes:
+    - audit-logs:/audit:rw
+  depends_on:
+    router:
+      condition: service_started
+
+x-apex-env: &apex-env
+  LLM_MODEL: ${LLM_MODEL:-claude-haiku-4-5-20251001}
+  LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ROUTER_URL: http://router:9090
+  ROAM_INTERVAL_HANDS: ${ROAM_INTERVAL_HANDS:-50}
+  SHADOW_POLL_INTERVAL_MS: ${SHADOW_POLL_INTERVAL_MS:-20000}
+  MIN_HANDS_FOR_SCORING: ${MIN_HANDS_FOR_SCORING:-20}
+  THINK_TIME_MS: ${THINK_TIME_MS:-30}
+  MAX_TOTAL_HANDS: ${MAX_TOTAL_HANDS:-2000}
+  ANCHOR_MODE: ${ANCHOR_MODE:-stub}
+  WALLET_URL: ${WALLET_URL:-}
+  WALLET_FUNDING_SATS: ${WALLET_FUNDING_SATS:-100000}
+  MSGBOX_HOST: ${MSGBOX_HOST:-https://messagebox.babbage.systems}
+  FEE_RATE: ${FEE_RATE:-0.1}
+  MIN_FEE: ${MIN_FEE:-135}
+  SPLIT_SATS: ${SPLIT_SATS:-2000}
+  REBUY_COST_SATS: ${REBUY_COST_SATS:-10}
+  PRIVATE_KEY_WIF: ${PRIVATE_KEY_WIF:-}
+  CHANGE_ADDRESS: ${CHANGE_ADDRESS:-}
+  FUNDING_TX_HEX: ${FUNDING_TX_HEX:-}
+  AUDIT_LOG_DIR: /audit
+
+services:
+  # ══════════════════════════════════════════
+  # Casino Floor — 8 nodes × N tables
+  # All heuristic-only. Zero LLM cost.
+  # ══════════════════════════════════════════
+
+  floor-0:
+    <<: *floor-base
+    container_name: casino-floor-0
+    environment:
+      <<: *floor-env
+      BOT_INDEX: "0"
+      FUNDING_VOUT: "0"
+
+  floor-1:
+    <<: *floor-base
+    container_name: casino-floor-1
+    environment:
+      <<: *floor-env
+      BOT_INDEX: "1"
+      FUNDING_VOUT: "1"
+
+  floor-2:
+    <<: *floor-base
+    container_name: casino-floor-2
+    environment:
+      <<: *floor-env
+      BOT_INDEX: "2"
+      FUNDING_VOUT: "2"
+
+  floor-3:
+    <<: *floor-base
+    container_name: casino-floor-3
+    environment:
+      <<: *floor-env
+      BOT_INDEX: "3"
+      FUNDING_VOUT: "3"
+
+  floor-4:
+    <<: *floor-base
+    container_name: casino-floor-4
+    environment:
+      <<: *floor-env
+      BOT_INDEX: "4"
+      FUNDING_VOUT: "4"
+
+  floor-5:
+    <<: *floor-base
+    container_name: casino-floor-5
+    environment:
+      <<: *floor-env
+      BOT_INDEX: "5"
+      FUNDING_VOUT: "5"
+
+  floor-6:
+    <<: *floor-base
+    container_name: casino-floor-6
+    environment:
+      <<: *floor-env
+      BOT_INDEX: "6"
+      FUNDING_VOUT: "6"
+
+  floor-7:
+    <<: *floor-base
+    container_name: casino-floor-7
+    environment:
+      <<: *floor-env
+      BOT_INDEX: "7"
+      FUNDING_VOUT: "7"
+
+  # ══════════════════════════════════════════
+  # Apex Predators — Multi-model AI tournament
+  # ══════════════════════════════════════════
+
+  apex-0:
+    <<: *apex-base
+    container_name: apex-predator-0
+    environment:
+      <<: *apex-env
+      APEX_INDEX: "0"
+      LLM_PROVIDER: "mock"
+      LLM_MODEL: "heuristic"
+      FUNDING_VOUT: "8"
+    depends_on:
+      router:
+        condition: service_started
+      floor-0:
+        condition: service_started
+
+  apex-1:
+    <<: *apex-base
+    container_name: apex-predator-1
+    environment:
+      <<: *apex-env
+      APEX_INDEX: "1"
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_MODEL: "claude-haiku-4-5-20251001"
+      FUNDING_VOUT: "9"
+    depends_on:
+      router:
+        condition: service_started
+      floor-2:
+        condition: service_started
+
+  apex-2:
+    <<: *apex-base
+    container_name: apex-predator-2
+    environment:
+      <<: *apex-env
+      APEX_INDEX: "2"
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_MODEL: "claude-sonnet-4-6"
+      FUNDING_VOUT: "10"
+    depends_on:
+      router:
+        condition: service_started
+      floor-4:
+        condition: service_started
+
+  apex-3:
+    <<: *apex-base
+    container_name: apex-predator-3
+    environment:
+      <<: *apex-env
+      APEX_INDEX: "3"
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_MODEL: "claude-opus-4-6"
+      FUNDING_VOUT: "11"
+    depends_on:
+      router:
+        condition: service_started
+      floor-6:
+        condition: service_started
+
+  # ══════════════════════════════════════════
+  # Rogue Agent — Adversarial cheater
+  # ══════════════════════════════════════════
+
+  apex-4:
+    <<: *apex-base
+    container_name: apex-predator-4
+    entrypoint: ["bun", "run", "src/entrypoint-rogue.ts"]
+    environment:
+      <<: *apex-env
+      APEX_INDEX: "4"
+      LLM_PROVIDER: "mock"
+      LLM_MODEL: "rogue"
+      FUNDING_VOUT: "12"
+    depends_on:
+      router:
+        condition: service_started
+      floor-0:
+        condition: service_started
+
+  # ══════════════════════════════════════════
+  # Border Router — Metrics + Player Stats
+  # ══════════════════════════════════════════
+
+  router:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: casino-router
+    init: true
+    entrypoint: ["bun", "run", "src/border-router.ts"]
+    ports:
+      - "9090:9090"
+    networks:
+      - casino-mesh
+    environment:
+      METRICS_PORT: "9090"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:9090/health').then(r => process.exit(r.ok ? 0 : 1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  audit-logs:
+
+networks:
+  casino-mesh:
+    driver: bridge

@@ -1,0 +1,29 @@
+{
+  "name": "semantos-poker-hackathon",
+  "version": "1.0.0",
+  "description": "Semantos CellToken Poker — BSV Hackathon Submission. Autonomous poker agents broadcasting linear-typed CellTokens to BSV mainnet via PushDrop, with Plexus VM opcodes for native miner-enforced cell semantics.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "show-address": "bun run scripts/show-funding-addresses.ts",
+    "pre-fund": "bun run scripts/pre-fund.ts",
+    "floor": "bun run src/entrypoint-floor.ts",
+    "apex": "bun run src/entrypoint-apex.ts",
+    "rogue": "bun run src/entrypoint-rogue.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^2.0.0",
+    "@anthropic-ai/sdk": "^0.39.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
