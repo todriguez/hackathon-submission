@@ -40,6 +40,11 @@
                  padding: 4px 8px; border-radius: 3px; margin-top: 4px; display: block; white-space: pre-wrap; }
   .refresh-bar { text-align: center; font-size: 0.7em; color: #444; padding: 4px; }
   .empty { color: #444; font-style: italic; padding: 8px; text-align: center; }
+  .dl-btn { display: inline-block; padding: 8px 16px; background: #1a3a5c; color: #00d4ff; border: 1px solid #0f3460;
+            border-radius: 4px; text-decoration: none; font-size: 0.85em; font-family: inherit; cursor: pointer; }
+  .dl-btn:hover { background: #244a6e; }
+  .dl-btn.dl-warn { background: #3a2a1a; color: #ffd700; border-color: #665500; }
+  .dl-btn.dl-warn:hover { background: #4a3a2a; }
 </style>
 </head>
 <body>
@@ -124,6 +129,18 @@
   <div class="card">
     <h2>Active Tables</h2>
     <div id="tables"><div class="empty">No tables reporting yet...</div></div>
+  </div>
+
+  <!-- Export / Audit -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Hackathon Audit Export</h2>
+    <div id="export-stats"><div class="empty">Loading export stats...</div></div>
+    <div style="margin-top: 12px; display: flex; gap: 12px; flex-wrap: wrap;">
+      <a href="/api/audit/export" download class="dl-btn">Download Txid Audit CSV</a>
+      <a href="/api/cells/export?payload=false" download class="dl-btn">Download CellTokens (lean)</a>
+      <a href="/api/cells/export" download class="dl-btn">Download CellTokens + Payload</a>
+      <a href="/api/cells/export?script=true" download class="dl-btn dl-warn">Download Full (with script hex)</a>
+    </div>
   </div>
 </div>
 
@@ -314,6 +331,17 @@ async function refreshApex() {
   ).join('');
 }
 
+async function refreshExportStats() {
+  const d = await fetchJSON('/api/cells/export/stats');
+  if (!d) return;
+  const el = document.getElementById('export-stats');
+  el.innerHTML =
+    `<div class="stat"><span class="label">Total CellTokens in overlay</span><span class="value">${fmt(d.totalCells)}</span></div>` +
+    Object.entries(d.estimates || {}).map(([key, est]) =>
+      `<div class="stat"><span class="label">${est.description}</span><span class="value">${est.totalMB} MB</span></div>`
+    ).join('');
+}
+
 // ── Refresh loop ──
 async function refresh() {
   await Promise.all([
@@ -327,6 +355,7 @@ async function refresh() {
     refreshTxDag(),
     refreshTables(),
     refreshApex(),
+    refreshExportStats(),
   ]);
 }
 

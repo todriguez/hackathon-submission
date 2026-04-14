@@ -1125,6 +1125,148 @@ const server = Bun.serve({
       return Response.json({ agents: summaries }, { headers: corsHeaders });
     }
 
+    // ══════════════════════════════════════════
+    // CSV Export Endpoints — Hackathon Proof
+    // ══════════════════════════════════════════
+
+    // GET /api/audit/export — Stream merged txid audit CSV from all containers
+    // Reads per-container CSVs from /audit/ volume and merges them
+    if (url.pathname === '/api/audit/export' && req.method === 'GET') {
+      try {
+        const auditDir = process.env.AUDIT_LOG_DIR ?? '/audit';
+        const glob = new Bun.Glob('txids-*.csv');
+        const files: string[] = [];
+        for await (const path of glob.scan(auditDir)) {
+          files.push(`${auditDir}/${path}`);
+        }
+
+        if (files.length === 0) {
+          return new Response('txid,type,sats_in,fee_sats,est_bytes,timestamp\n', {
+            headers: { ...corsHeaders, 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="audit-txids.csv"' },
+          });
+        }
+
+        // Stream merge: header once, then all data rows
+        const header = 'txid,type,sats_in,fee_sats,est_bytes,timestamp,source_file\n';
+        const chunks: string[] = [header];
+
+        for (const filePath of files) {
+          const source = filePath.split('/').pop() ?? '';
+          const text = await Bun.file(filePath).text();
+          const lines = text.split('\n');
+          for (let i = 1; i < lines.length; i++) { // skip header
+            const line = lines[i].trim();
+            if (line) chunks.push(`${line},${source}\n`);
+          }
+        }
+
+        return new Response(chunks.join(''), {
+          headers: {
+            ...corsHeaders,
+            'Content-Type': 'text/csv; charset=utf-8',
+            'Content-Disposition': 'attachment; filename="audit-txids.csv"',
+          },
+        });
+      } catch (err: any) {
+        return Response.json({ error: err.message }, { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // GET /api/cells/export — Stream full cell data CSV from overlay SQLite
+    // Includes: txid, hand_id, phase, version, semantic_path, content_hash,
+    //           cell_hash, prev_state_hash, linearity, estimated_bytes,
+    //           estimated_fee_sats, state_payload (JSON), timestamp, source_id
+    if (url.pathname === '/api/cells/export' && req.method === 'GET') {
+      const includePayload = url.searchParams.get('payload') !== 'false';
+      const includeScript = url.searchParams.get('script') === 'true'; // off by default (huge)
+
+      const columns = [
+        'shadow_txid', 'hand_id', 'phase', 'version', 'semantic_path',
+        'content_hash', 'cell_hash', 'prev_state_hash', 'owner_pubkey',
+        'linearity', 'cell_size', 'estimated_bytes', 'estimated_fee_sats',
+        'source_id', 'timestamp',
+      ];
+      if (includePayload) columns.push('state_payload');
+      if (includeScript) columns.push('full_script_hex');
+
+      const header = columns.join(',') + '\n';
+
+      // Stream in batches of 10K rows for memory efficiency
+      const batchSize = 10_000;
+      let offset = 0;
+      const chunks: string[] = [header];
+
+      const selectSQL = `SELECT ${columns.join(',')} FROM cells ORDER BY timestamp ASC LIMIT ? OFFSET ?`;
+
+      while (true) {
+        const rows = overlayDb.prepare(selectSQL).all(batchSize, offset) as any[];
+        if (rows.length === 0) break;
+
+        for (const row of rows) {
+          const vals = columns.map(col => {
+            const v = row[col];
+            if (v == null) return '';
+            const s = String(v);
+            // Escape CSV: quote if contains comma, newline, or quote
+            if (s.includes(',') || s.includes('\n') || s.includes('"')) {
+              return `"${s.replace(/"/g, '""')}"`;
+            }
+            return s;
+          });
+          chunks.push(vals.join(',') + '\n');
+        }
+
+        offset += batchSize;
+        if (rows.length < batchSize) break;
+      }
+
+      const totalRows = offset > 0 ? offset - batchSize + (overlayDb.prepare(selectSQL).all(batchSize, offset) as any[]).length : 0;
+
+      return new Response(chunks.join(''), {
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': `attachment; filename="celltokens-${new Date().toISOString().slice(0,10)}.csv"`,
+        },
+      });
+    }
+
+    // GET /api/cells/export/stats — preview what the export will contain
+    if (url.pathname === '/api/cells/export/stats' && req.method === 'GET') {
+      const count = (overlayDb.prepare('SELECT COUNT(*) as c FROM cells').get() as any)?.c ?? 0;
+      const totalBytes = (overlayDb.prepare('SELECT SUM(LENGTH(state_payload)) as s FROM cells').get() as any)?.s ?? 0;
+      const scriptBytes = (overlayDb.prepare('SELECT SUM(LENGTH(full_script_hex)) as s FROM cells').get() as any)?.s ?? 0;
+
+      // Estimate CSV sizes
+      const leanRowBytes = 200; // txid + metadata only
+      const payloadRowBytes = 200 + (count > 0 ? Math.ceil(totalBytes / count) : 500);
+      const fullRowBytes = payloadRowBytes + (count > 0 ? Math.ceil(scriptBytes / count) : 2000);
+
+      return Response.json({
+        totalCells: count,
+        estimates: {
+          leanCsv: {
+            description: 'txid + metadata (no payload, no script)',
+            url: '/api/cells/export?payload=false',
+            rowBytes: leanRowBytes,
+            totalMB: ((count * leanRowBytes) / 1e6).toFixed(1),
+          },
+          withPayload: {
+            description: 'txid + metadata + JSON game state',
+            url: '/api/cells/export',
+            rowBytes: payloadRowBytes,
+            totalMB: ((count * payloadRowBytes) / 1e6).toFixed(1),
+          },
+          full: {
+            description: 'txid + metadata + JSON + full script hex (LARGE)',
+            url: '/api/cells/export?script=true',
+            rowBytes: fullRowBytes,
+            totalMB: ((count * fullRowBytes) / 1e6).toFixed(1),
+          },
+        },
+      }, { headers: corsHeaders });
+    }
+
     return new Response('Not Found', { status: 404, headers: corsHeaders });
   },
   websocket: {
