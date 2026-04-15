@@ -361,22 +361,45 @@ export class DirectBroadcastEngine {
     const txHex = tx.toHex();
     this.log('SPLIT', `Tx size: ${txHex.length / 2} bytes, actual fee: ${funding.satoshis - totalOut - (change > 546 ? change : 0)} sats`);
 
-    const result = await tx.broadcast(this.arc);
-
-    if ('status' in result && result.status === 'error') {
-      const fail = result as any;
-      this.log('SPLIT', `ARC error response: ${JSON.stringify(fail)}`);
-      throw new Error(`Split broadcast failed: code=${fail.code} desc=${fail.description} more=${JSON.stringify(fail.more)}`);
+    let arcOk = false;
+    try {
+      const result = await tx.broadcast(this.arc);
+      if ('status' in result && result.status === 'error') {
+        const fail = result as any;
+        this.log('SPLIT', `ARC error (will retry via WoC): code=${fail.code} desc=${fail.description}`);
+      } else {
+        arcOk = true;
+      }
+    } catch (arcErr: any) {
+      this.log('SPLIT', `ARC broadcast exception (will retry via WoC): ${arcErr.message}`);
     }
 
     const txid = tx.id('hex') as string;
+
+    // Always try WoC as backup/primary
+    const wocOk = await this.wocBroadcast(txHex);
+    this.log('SPLIT', `WoC broadcast: ${wocOk ? 'OK' : 'FAILED'}`);
+
+    if (!arcOk && !wocOk) {
+      throw new Error(`Split broadcast failed on both ARC and WoC. txid=${txid}`);
+    }
+
+    // Verify tx is visible (wait up to 10s)
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const check = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`);
+        if (check.ok && (await check.text()).length > 100) {
+          this.log('SPLIT', `✓ Confirmed visible on-chain: ${txid}`);
+          break;
+        }
+      } catch {}
+      this.log('SPLIT', `Waiting for tx propagation... (attempt ${attempt + 1}/5)`);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
     this.logTxid(txid, 'split', funding.satoshis, fee, txHex.length / 2);
     this.log('SPLIT', `✓ Fan-out tx: ${txid} (${splits} outputs)`);
     this.log('SPLIT', `  https://whatsonchain.com/tx/${txid}`);
-
-    // Dual-broadcast: ARC can say ANNOUNCED but not actually propagate
-    await this.wocBroadcast(txHex);
-    this.log('SPLIT', `WoC backup broadcast sent`);
 
     // Partition UTXOs across streams
     this.utxoPools = Array.from({ length: this.config.streams }, () => []);
@@ -974,7 +997,7 @@ export class DirectBroadcastEngine {
    * Broadcast raw tx hex via WhatsOnChain's node endpoint as a backup.
    * ARC's ANNOUNCED_TO_NETWORK doesn't guarantee propagation — WoC goes direct to nodes.
    */
-  private async wocBroadcast(txHex: string): Promise<void> {
+  private async wocBroadcast(txHex: string): Promise<boolean> {
     try {
       const resp = await fetch('https://api.whatsonchain.com/v1/bsv/main/tx/raw', {
         method: 'POST',
@@ -984,10 +1007,13 @@ export class DirectBroadcastEngine {
       if (!resp.ok) {
         const body = await resp.text();
         this.log('WOC', `Backup broadcast returned ${resp.status}: ${body.slice(0, 200)}`);
+        return false;
       }
+      return true;
     } catch (err: any) {
       // Non-fatal — ARC is primary, WoC is belt-and-suspenders
       this.log('WOC', `Backup broadcast failed: ${err.message}`);
+      return false;
     }
   }
 
