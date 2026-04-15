@@ -21,6 +21,7 @@
 
 import type { Hand, PolicyEvolutionCell } from './agent/shadow-loop-types';
 import { PaskianAdapter } from './stubs/paskian';
+import Anthropic from '@anthropic-ai/sdk';
 
 // ── Paskian Learning Layer ──
 
@@ -208,6 +209,8 @@ interface SwarmEMASnapshot {
 
 /** Latest EMA snapshot per player — shows swarm convergence */
 const swarmEMAState = new Map<string, SwarmEMASnapshot & { tableId: string; timestamp: number }>();
+/** EMA history timeline — every update stored for report generation */
+const swarmEMATimeline: Array<SwarmEMASnapshot & { tableId: string; timestamp: number }> = [];
 let swarmUpdatesIngested = 0;
 
 // ── Per-Player Stats (for vulnerability scoring) ──
@@ -425,6 +428,86 @@ function computeLearningCurve(): void {
       timestamp: hand.actions[0]?.timestamp ?? Date.now(),
     };
   }
+}
+
+// ── Report Prompt Builder ──
+
+function buildReportPrompt(data: any): string {
+  return `You are an expert poker analytics researcher producing a post-tournament intelligence report for a BSV blockchain hackathon submission.
+
+## Context
+
+A multi-agent poker simulation ran on BSV mainnet. Every game state transition was recorded as a CellToken (BRC-48 PushDrop transaction) on-chain. The system has:
+
+1. **Floor bots** — heuristic players with fixed personas (nit, maniac, calculator, apex)
+2. **Swarm EMA** — each bot adapts its play via exponential moving average of win rate & chip delta
+3. **Paskian Learning** — a semantic graph that detects behavioral convergence/divergence patterns across the swarm
+4. **Payment Channels** — hub-and-spoke channels where every bet/award is a channel tick (on-chain CellToken)
+
+## Your Task
+
+Produce a **blinded analysis report** — analyze the data below as if you don't know the EMA algorithm or Paskian implementation. Then cross-reference your observations against the actual algorithm (provided at the end).
+
+### Report Structure
+
+1. **Executive Summary** (2-3 sentences)
+2. **Swarm Behavioral Analysis** — what patterns emerged across personas? Did any persona dominate? Was there convergence or divergence?
+3. **Paskian Thread Interpretation** — what do the stable/emerging threads mean in plain English? Were there meaningful behavioral shifts?
+4. **EMA-Paskian Correlation** — did EMA drift events trigger Paskian thread changes? Cite specific examples from the timeline.
+5. **Most Meaningful Episodes** — identify the 3-5 highest-impact moments. For each:
+   - What happened (who won/lost, what actions led to the outcome)
+   - Which player personas were involved
+   - What Paskian state was active at that moment
+   - What EMA readings showed
+   - The associated hand ID (which maps to an on-chain CellToken chain)
+6. **Predator-Prey Dynamics** — did apex-persona players exploit specific heuristic vulnerabilities? When the swarm adapted (EMA shifted), did the exploitation pattern change?
+7. **Algorithm Cross-Reference** — now, given the actual EMA algorithm below, assess:
+   - Did the Paskian detection correctly identify meaningful EMA events?
+   - Were there false positives (Paskian saw a pattern that wasn't real)?
+   - Were there missed signals (EMA shifted but Paskian didn't detect it)?
+   - Overall: is this a meaningful adaptive system or noise?
+8. **Conclusion** — 2-3 sentences on whether the on-chain CellToken audit trail captures genuine adaptive intelligence
+
+## Game Data
+
+### Run Statistics
+${JSON.stringify(data.meta, null, 2)}
+
+### Player Performance Summary
+${JSON.stringify(data.playerSummaries, null, 2)}
+
+### EMA Algorithm (for cross-reference in Section 7)
+${JSON.stringify(data.emaAlgorithm, null, 2)}
+
+### Paskian Interaction Types
+${JSON.stringify(data.paskian.interactionTypes, null, 2)}
+
+### Stable Paskian Threads (converged behavioral patterns)
+${JSON.stringify(data.paskian.stableThreads, null, 2)}
+
+### Emerging Paskian Threads (developing patterns)
+${JSON.stringify(data.paskian.emergingThreads, null, 2)}
+
+### EMA Timeline (sampled snapshots showing swarm evolution)
+${JSON.stringify(data.emaTimeline, null, 2)}
+
+### Significant Hands (highest-impact episodes)
+${JSON.stringify(data.significantHands?.slice(0, 30), null, 2)}
+
+### Payment Channel Summary
+${JSON.stringify(data.paymentChannels, null, 2)}
+
+### Premium Hands
+${JSON.stringify(data.premiumHands, null, 2)}
+
+## Formatting
+
+- Use markdown headers, tables, and bullet points
+- Bold key findings
+- Reference specific hand IDs as \`hand-id\` (these map to on-chain CellToken chains)
+- Reference specific player IDs by their persona label (e.g., "the nit at table-0")
+- Keep it factual and analytical — this goes to hackathon judges
+- Total length: 1500-2500 words`;
 }
 
 // ── HTTP Server ──
@@ -767,7 +850,9 @@ const server = Bun.serve({
         const body = await req.json() as { tableId: string; snapshots: SwarmEMASnapshot[]; timestamp: number };
         swarmUpdatesIngested++;
         for (const snap of body.snapshots) {
-          swarmEMAState.set(snap.playerId, { ...snap, tableId: body.tableId, timestamp: body.timestamp });
+          const entry = { ...snap, tableId: body.tableId, timestamp: body.timestamp };
+          swarmEMAState.set(snap.playerId, entry);
+          swarmEMATimeline.push(entry);
 
           // Fire Paskian interaction: EMA drift from baseline
           // This lets Paskian detect when the swarm converges or diverges
@@ -934,6 +1019,153 @@ const server = Bun.serve({
     // GET /api/settlements — settlement history
     if (url.pathname === '/api/settlements' && req.method === 'GET') {
       return Response.json(settlements, { headers: corsHeaders });
+    }
+
+    // GET /api/report-data — comprehensive data dump for Opus blinded report generation
+    if (url.pathname === '/api/report-data' && req.method === 'GET') {
+      // Sample significant hands (highest pots, most actions)
+      const sortedHands = [...hands].sort((a, b) => {
+        const potA = botStats.get(a.winner)?.totalPotWon ?? 0;
+        const potB = botStats.get(b.winner)?.totalPotWon ?? 0;
+        return potB - potA;
+      });
+      const significantHands = sortedHands.slice(0, 50).map(h => ({
+        id: h.id,
+        winner: h.myBotId === h.winner ? h.myBotId : h.winner,
+        actionCount: h.actions.length,
+        actions: h.actions.map(a => ({ botId: a.botId, type: a.type, amount: a.amount })),
+        showdown: h.showdown,
+      }));
+
+      // Paskian threads
+      let stableThreads: any[] = [];
+      let emergingThreads: any[] = [];
+      try { stableThreads = paskian.store.stableThreads(); } catch {}
+      try { emergingThreads = paskian.store.emergingThreads(120_000); } catch {}
+
+      // EMA timeline (sample every Nth entry if too large)
+      const maxEmaEntries = 200;
+      const emaStep = Math.max(1, Math.floor(swarmEMATimeline.length / maxEmaEntries));
+      const emaTimeline = swarmEMATimeline.filter((_, i) => i % emaStep === 0).map(e => ({
+        playerId: e.playerId,
+        persona: e.persona,
+        tableId: e.tableId,
+        winRate: e.ema.emaWinRate,
+        chipDelta: e.ema.emaChipDelta,
+        handsObserved: e.ema.handsObserved,
+        timestamp: e.timestamp,
+      }));
+
+      // Player stats summary
+      const playerSummaries = Array.from(playerStats.values()).map(ps => ({
+        playerId: ps.playerId.slice(0, 16),
+        persona: ps.persona,
+        tableId: ps.tableId,
+        handsPlayed: ps.handsPlayed,
+        handsWon: ps.handsWon,
+        winRate: ps.handsPlayed > 0 ? (ps.handsWon / ps.handsPlayed * 100).toFixed(1) + '%' : '0%',
+        chips: ps.chips,
+        chipDelta: ps.chipDelta,
+        foldPct: ps.totalActions > 0 ? (ps.foldCount / ps.totalActions * 100).toFixed(1) + '%' : '—',
+        raisePct: ps.totalActions > 0 ? (ps.raiseCount / ps.totalActions * 100).toFixed(1) + '%' : '—',
+        showdownWinPct: ps.showdownCount > 0 ? (ps.showdownWins / ps.showdownCount * 100).toFixed(1) + '%' : '—',
+      }));
+
+      // Cell overlay stats
+      const cellCount = (overlayDb.prepare('SELECT COUNT(*) as count FROM cells').get() as any)?.count ?? 0;
+      const totalFee = (overlayDb.prepare('SELECT SUM(estimated_fee_sats) as total FROM cells').get() as any)?.total ?? 0;
+
+      // Payment channel summary
+      let channelSummary = { totalBets: 0, totalAwards: 0, totalTicks: 0, channelCount: 0 };
+      for (const report of paymentChannels) {
+        channelSummary.totalBets += report.stats.totalBets;
+        channelSummary.totalAwards += report.stats.totalAwards;
+        channelSummary.totalTicks += report.stats.totalTicks;
+        channelSummary.channelCount += report.stats.channelCount;
+      }
+
+      return Response.json({
+        meta: {
+          totalHands: hands.length,
+          totalTxCount,
+          totalCellTokens: cellCount,
+          totalFeeSats: totalFee,
+          totalEstFeeBsv: (totalFee / 1e8).toFixed(8),
+          totalPlayers: playerStats.size,
+          totalEliminations,
+          uptimeMs: Date.now() - startTime,
+        },
+        playerSummaries,
+        significantHands,
+        emaTimeline,
+        emaAlgorithm: {
+          description: 'Exponential Moving Average of win rate and chip delta per player',
+          formula: 'EMA(t) = alpha * observation + (1 - alpha) * EMA(t-1)',
+          baseline: '0.25 (expected win rate for 4-player table)',
+          driftThreshold: '±0.05 from baseline triggers SWARM_WINNING/SWARM_LOSING Paskian event',
+          personas: ['nit (tight-passive)', 'maniac (loose-aggressive)', 'calculator (GTO-ish)', 'apex (adaptive predator)'],
+        },
+        paskian: {
+          stableThreads,
+          emergingThreads,
+          interactionTypes: [
+            'HAND_WON (strength = normalized pot / 500, capped at 1.0)',
+            'HAND_LOST (strength = -normalized pot)',
+            'FOLD (strength = -0.05)',
+            'RAISE (strength = min(0.5, amount / 500))',
+            'SWARM_WINNING (strength = drift * 4, capped [-1, 1])',
+            'SWARM_LOSING (strength = drift * 4, capped [-1, 1])',
+          ],
+        },
+        paymentChannels: channelSummary,
+        premiumHands: premiumHands.slice(0, 20),
+        agentMatchups: agentMatchups.slice(0, 20),
+      }, { headers: corsHeaders });
+    }
+
+    // POST /api/generate-report — trigger Opus blinded analysis report
+    if (url.pathname === '/api/generate-report' && req.method === 'POST') {
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) {
+        return Response.json({ error: 'ANTHROPIC_API_KEY not set on server' }, { status: 500, headers: corsHeaders });
+      }
+      return (async () => {
+        try {
+          // Fetch report data from ourselves
+          const reportRes = await fetch(`http://localhost:${METRICS_PORT}/api/report-data`);
+          const data = await reportRes.json();
+
+          const prompt = buildReportPrompt(data);
+          console.log(`[BorderRouter] Generating report via Anthropic API (${(prompt.length / 1024).toFixed(1)} KB prompt)...`);
+
+          const client = new Anthropic({ apiKey });
+          const model = process.env.REPORT_MODEL ?? 'claude-sonnet-4-20250514';
+          const message = await client.messages.create({
+            model,
+            max_tokens: 4096,
+            messages: [{ role: 'user', content: prompt }],
+          });
+
+          const text = message.content
+            .filter((b: any): b is Anthropic.TextBlock => b.type === 'text')
+            .map((b: any) => b.text)
+            .join('\n');
+
+          // Save to file
+          const { mkdirSync, writeFileSync } = await import('fs');
+          mkdirSync('reports', { recursive: true });
+          const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+          const filename = `reports/hackathon-report-${ts}.md`;
+          const header = `# Hackathon Post-Run Analysis Report\n> Generated: ${new Date().toISOString()}\n> Model: ${model}\n> Hands: ${data.meta.totalHands} | Txs: ${data.meta.totalTxCount} | CellTokens: ${data.meta.totalCellTokens}\n> Fee spend: ${data.meta.totalEstFeeBsv} BSV (${data.meta.totalFeeSats} sats)\n\n---\n\n`;
+          writeFileSync(filename, header + text);
+          console.log(`[BorderRouter] Report saved to ${filename}`);
+
+          return Response.json({ ok: true, report: text, savedTo: filename, model, tokens: message.usage?.output_tokens }, { headers: corsHeaders });
+        } catch (err: any) {
+          console.error(`[BorderRouter] Report generation failed: ${err.message}`);
+          return Response.json({ error: err.message }, { status: 500, headers: corsHeaders });
+        }
+      })();
     }
 
     // POST /api/payment-channels — ingest payment channel summary from floor

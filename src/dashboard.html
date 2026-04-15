@@ -187,6 +187,23 @@
       <a href="/api/cells/export?script=true" download class="dl-btn dl-warn">Download Full (with script hex)</a>
     </div>
   </div>
+
+  <!-- Opus Post-Run Report -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Post-Run Intelligence Report</h2>
+    <p style="font-size:0.75em; color:#666; margin-bottom:8px;">
+      Blinded analysis by Claude: Paskian policy iterations vs EMA swarm drift, predator-prey dynamics, and most meaningful EV episodes with on-chain CellToken references.
+    </p>
+    <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 12px;">
+      <button onclick="generateReport()" class="dl-btn" id="report-btn" style="cursor:pointer; border:none; padding:8px 16px;">
+        Generate Opus Report
+      </button>
+      <a href="/api/report-data" target="_blank" class="dl-btn" style="text-decoration:none; font-size:0.8em;">View Raw Data (JSON)</a>
+      <span id="report-status" style="font-size:0.75em; color:#7b7baa;"></span>
+    </div>
+    <div id="report-output" style="max-height:600px; overflow-y:auto; display:none; background:#0a0a14; border:1px solid #1a1a3a; border-radius:6px; padding:16px;">
+    </div>
+  </div>
 </div>
 
 <div class="refresh-bar">Auto-refreshes every 2s | WebSocket for live events</div>
@@ -334,6 +351,45 @@ async function refreshSettlements() {
       `<td style="color:${s.chipsWon >= 0 ? '#00ff88' : '#ff4444'}">${s.chipsWon > 0 ? '+' : ''}${fmt(s.chipsWon)}</td>` +
       `<td>${fmt(s.handsPlayed)}</td><td>${s.broadcastTxids?.length ? txLink(s.broadcastTxids[0]) : '—'}</td></tr>`
     ).join('') + `</table>`;
+}
+
+async function generateReport() {
+  const btn = document.getElementById('report-btn');
+  const status = document.getElementById('report-status');
+  const output = document.getElementById('report-output');
+  btn.disabled = true;
+  btn.textContent = 'Generating...';
+  status.textContent = 'Calling Anthropic API — this may take 30-60 seconds...';
+  output.style.display = 'none';
+  try {
+    const res = await fetch('/api/generate-report', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      status.textContent = 'Error: ' + data.error;
+      status.style.color = '#ff4444';
+    } else {
+      status.textContent = `Done (${data.tokens} tokens, saved to ${data.savedTo})`;
+      status.style.color = '#4ecdc4';
+      output.style.display = 'block';
+      // Simple markdown rendering — headers, bold, bullets
+      output.innerHTML = data.report
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/^### (.+)$/gm, '<h4 style="color:#4ecdc4;margin:16px 0 8px;">$1</h4>')
+        .replace(/^## (.+)$/gm, '<h3 style="color:#f5c542;margin:20px 0 10px;">$1</h3>')
+        .replace(/^# (.+)$/gm, '<h2 style="color:#fff;margin:24px 0 12px;">$1</h2>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong style="color:#fff;">$1</strong>')
+        .replace(/`([^`]+)`/g, '<code style="background:#1a1a3a;padding:2px 4px;border-radius:3px;color:#4ecdc4;">$1</code>')
+        .replace(/^- (.+)$/gm, '<div style="margin-left:16px;margin-bottom:4px;">- $1</div>')
+        .replace(/^\d+\. (.+)$/gm, '<div style="margin-left:16px;margin-bottom:4px;">$&</div>')
+        .replace(/\n{2,}/g, '<br><br>')
+        .replace(/\n/g, '<br>');
+    }
+  } catch (err) {
+    status.textContent = 'Failed: ' + err.message;
+    status.style.color = '#ff4444';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Generate Opus Report';
 }
 
 async function refreshTxDag() {
