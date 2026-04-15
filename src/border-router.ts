@@ -626,6 +626,7 @@ const server = Bun.serve({
           },
           premiumHands: premiumHands.length,
           agentMatchups: agentMatchups.length,
+          totalUniquePlayers,
           swarmTracked: swarmEMAState.size,
           swarmUpdates: swarmUpdatesIngested,
         },
@@ -782,6 +783,7 @@ const server = Bun.serve({
             }).catch(() => {});
           }
         }
+        broadcastWs({ type: 'swarm-ema', tableId: body.tableId });
         return Response.json({ ok: true, tracked: swarmEMAState.size, updates: swarmUpdatesIngested }, { headers: corsHeaders });
       })();
     }
@@ -862,14 +864,22 @@ const server = Bun.serve({
 
     // GET /api/tables — table summary
     if (url.pathname === '/api/tables' && req.method === 'GET') {
-      const tables = new Map<string, { players: string[]; totalHands: number }>();
+      const tablesMap = new Map<string, { players: PlayerFloorStats[]; totalHands: number }>();
       for (const ps of playerStats.values()) {
-        let t = tables.get(ps.tableId);
-        if (!t) { t = { players: [], totalHands: 0 }; tables.set(ps.tableId, t); }
-        t.players.push(`${ps.playerId.slice(0, 12)}(${ps.persona})`);
+        let t = tablesMap.get(ps.tableId);
+        if (!t) { t = { players: [], totalHands: 0 }; tablesMap.set(ps.tableId, t); }
+        t.players.push(ps);
         t.totalHands = Math.max(t.totalHands, ps.handsPlayed);
       }
-      return Response.json(Object.fromEntries(tables), { headers: corsHeaders });
+      const tables = Array.from(tablesMap.entries()).map(([tableId, t]) => ({
+        tableId,
+        playerCount: t.players.length,
+        handsPlayed: t.totalHands,
+        avgChips: t.players.length > 0
+          ? t.players.reduce((sum, p) => sum + p.chips, 0) / t.players.length
+          : 0,
+      }));
+      return Response.json({ tables }, { headers: corsHeaders });
     }
 
     // GET /api/paskian/stable-threads — converged behavioral patterns
@@ -929,11 +939,33 @@ const server = Bun.serve({
     // POST /api/payment-channels — ingest payment channel summary from floor
     if (url.pathname === '/api/payment-channels' && req.method === 'POST') {
       return (async () => {
-        const body = await req.json() as PaymentChannelReport;
-        paymentChannels.push(body);
-        broadcastWs({ type: 'payment-channels', tableId: body.tableId, stats: body.stats });
+        const raw = await req.json() as any;
+        // Map from HubStats fields (floor) to PaymentChannelReport fields (dashboard)
+        const hubStats = raw.stats ?? {};
+        const summary = raw.summary ?? raw.channels ?? [];
+        const report: PaymentChannelReport = {
+          tableId: raw.tableId,
+          channels: summary.map((ch: any) => ({
+            channelId: ch.channelId ?? '',
+            playerId: ch.playerId ?? '',
+            state: ch.state ?? 'unknown',
+            totalBets: ch.betSats ?? ch.totalBets ?? 0,
+            totalAwards: ch.awardSats ?? ch.totalAwards ?? 0,
+            netFlow: ch.netSats ?? ch.netFlow ?? 0,
+            ticks: ch.tickCount ?? ch.ticks ?? 0,
+          })),
+          stats: {
+            totalBets: hubStats.totalSatsTransferred ?? hubStats.totalBets ?? 0,
+            totalAwards: hubStats.totalSatsAwarded ?? hubStats.totalAwards ?? 0,
+            totalTicks: hubStats.totalTicks ?? 0,
+            channelCount: hubStats.totalChannelsSettled ?? hubStats.channelCount ?? hubStats.totalChannelsOpened ?? 0,
+          },
+          timestamp: raw.timestamp ?? Date.now(),
+        };
+        paymentChannels.push(report);
+        broadcastWs({ type: 'payment-channels', tableId: report.tableId, stats: report.stats });
         console.log(
-          `[BorderRouter] Payment channels: ${body.tableId} — ${body.stats.channelCount} channels, ${body.stats.totalTicks} ticks, net ${body.stats.totalBets - body.stats.totalAwards} sats`,
+          `[BorderRouter] Payment channels: ${report.tableId} — ${report.stats.channelCount} channels, ${report.stats.totalTicks} ticks, net ${report.stats.totalBets - report.stats.totalAwards} sats`,
         );
         return Response.json({ ok: true, totalReports: paymentChannels.length }, { headers: corsHeaders });
       })();
@@ -1004,6 +1036,7 @@ const server = Bun.serve({
           } catch {}
         }
         totalCellsIngested += ingested;
+        broadcastWs({ type: 'cells', count: ingested });
         return Response.json({ ok: true, ingested, totalCells: totalCellsIngested }, { headers: corsHeaders });
       })();
     }
@@ -1043,15 +1076,34 @@ const server = Bun.serve({
       const totalBytes = overlayDb.prepare('SELECT SUM(estimated_bytes) as total FROM cells').get() as any;
       const totalFee = overlayDb.prepare('SELECT SUM(estimated_fee_sats) as total FROM cells').get() as any;
       const chainDepth = overlayDb.prepare('SELECT MAX(version) as max_version FROM cells').get() as any;
+      const uniqueHandsRow = overlayDb.prepare('SELECT COUNT(DISTINCT hand_id) as count FROM cells').get() as any;
+      const uniqueSourcesRow = overlayDb.prepare('SELECT COUNT(DISTINCT source_id) as count FROM cells').get() as any;
+
+      const cellCount = total?.count ?? 0;
+      const estBytes = totalBytes?.total ?? 0;
+      const estFee = totalFee?.total ?? 0;
+
+      // Build phaseBreakdown from byPhase rows
+      const phaseBreakdown: Record<string, number> = { preflop: 0, flop: 0, turn: 0, river: 0, showdown: 0, complete: 0 };
+      for (const row of byPhase as any[]) {
+        if (row.phase in phaseBreakdown) {
+          phaseBreakdown[row.phase] = row.count;
+        }
+      }
 
       return Response.json({
-        totalCells: total?.count ?? 0,
+        totalCells: cellCount,
         byPhase,
         bySource,
-        totalEstimatedBytes: totalBytes?.total ?? 0,
-        totalEstimatedFeeSats: totalFee?.total ?? 0,
+        totalEstimatedBytes: estBytes,
+        totalEstimatedFeeSats: estFee,
+        avgEstimatedBytes: cellCount > 0 ? estBytes / cellCount : 0,
+        avgEstimatedFeeSats: cellCount > 0 ? estFee / cellCount : 0,
+        uniqueHands: uniqueHandsRow?.count ?? 0,
+        uniqueSources: uniqueSourcesRow?.count ?? 0,
+        phaseBreakdown,
         maxChainDepth: chainDepth?.max_version ?? 0,
-        wouldCostBsv: ((totalFee?.total ?? 0) / 1e8).toFixed(8),
+        wouldCostBsv: (estFee / 1e8).toFixed(8),
       }, { headers: corsHeaders });
     }
 
@@ -1128,7 +1180,19 @@ const server = Bun.serve({
       const totalFee = overlayDb.prepare('SELECT SUM(estimated_fee_sats) as total FROM cells').get() as any;
       const totalBytes = overlayDb.prepare('SELECT SUM(estimated_bytes) as total FROM cells').get() as any;
 
+      // Build chains grouped by hand_id for dashboard consumption
+      const handRows = overlayDb.prepare(
+        'SELECT DISTINCT hand_id FROM cells ORDER BY hand_id',
+      ).all() as any[];
+      const chains = handRows.map((row: any) => {
+        const cells = overlayDb.prepare(
+          'SELECT phase, shadow_txid, version, semantic_path, estimated_bytes, estimated_fee_sats, timestamp FROM cells WHERE hand_id = ? ORDER BY version ASC',
+        ).all(row.hand_id) as any[];
+        return { handId: row.hand_id, cells };
+      });
+
       return Response.json({
+        chains,
         summary: {
           totalCells: totalCells?.count ?? 0,
           totalSources: sources.length,
@@ -1142,12 +1206,6 @@ const server = Bun.serve({
           tips: tips.slice(0, 100),
           policyEvolution: policyCells,
         },
-        // The full DAG tree: funding → preSplit → streams → cells
-        // In live mode, each floor node has a DirectBroadcastEngine with:
-        //   1. Funding UTXO (single external tx)
-        //   2. Pre-split fan-out (N × 500-sat UTXOs)
-        //   3. Per-stream cell chains (1-sat PushDrop CellTokens)
-        //   4. Change recycled back to stream pool
         architecture: {
           fundingModel: 'Each floor node + each apex agent has its own DirectBroadcastEngine',
           utxoFlow: 'external funding → P2PKH → preSplit fan-out → N streams → 1sat PushDrop CellTokens + change recycling',
