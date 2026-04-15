@@ -16,7 +16,7 @@ This is **not** a poker game. Poker is the data generator — a high-churn envir
 
 5. **Kernel-enforced cheat detection** — a rogue agent runs 5 exploit classes against the system. The 2PDA kernel validates every state transition and catches invalid moves. Cheat attempts are logged as CellTokens — the detection itself is on-chain evidence.
 
-6. **On-chain payment channels with auditable tick proofs** — each bet between agents operates inside a 2-of-2 multisig payment channel. Every betting increment emits a CellToken transition (v_n → v_{n+1}) on-chain, kernel-validated with HMAC-SHA256 tick proofs. The internal channel mechanism is fully auditable — you can trace every satoshi movement through the channel's CellToken state chain. Settlement closes the multisig with nSequence encoding the final state version.
+6. **Hub-and-spoke payment channels with auditable tick proofs** — bilateral payment channels don't work when 4 players share a communal pot. We solve this with a hub-and-spoke design: the table engine is the central counterparty, and each player opens a 2-of-2 multisig channel with the table. Bets tick the bettor's channel (player→table), pot awards tick the winner's channel (table→player). Every tick is HMAC-SHA256 authenticated and emits a CellToken transition (v_n → v_{n+1}) on-chain. The internal channel mechanism is fully auditable — you can trace every satoshi through the state chain. Settlement closes all N channels with an 8-state FSM (NEGOTIATING→FUNDED→ACTIVE→PAUSED→CLOSING→SETTLED/DISPUTED).
 
 ## Why This Matters
 
@@ -78,15 +78,24 @@ Every arrow is auditable. Every CellToken is on BSV mainnet. Every policy versio
 ┌──────────────────────▼──────────────────────────────────────────┐
 │                    PAYMENT CHANNEL LAYER                         │
 │                                                                 │
-│  2-of-2 multisig channels between competing agents              │
-│  Each bet = a CellToken transition (v_n → v_{n+1})              │
-│  HMAC-SHA256 tick proofs authenticate every state update         │
+│  Hub-and-spoke: table engine is the hub, each player is a spoke │
+│                                                                 │
+│         ┌──── 2-of-2 ↔ Player 0 (bets →, awards ←)             │
+│  Table  ├──── 2-of-2 ↔ Player 1                                │
+│  Engine ├──── 2-of-2 ↔ Player 2                                │
+│  (hub)  └──── 2-of-2 ↔ Player 3                                │
+│                                                                 │
+│  Bets: tick bettor's channel (player → table)                   │
+│  Pot awards: tick winner's channel (table → player)             │
+│  Each tick: HMAC-SHA256 proof + CellToken transition on-chain   │
 │  8-state FSM: NEGOTIATE → FUND → ACTIVE → CLOSE → SETTLE       │
-│  Settlement: nSequence encodes final kernel-validated version    │
 │  Violations: AFFINE CellTokens + per-offender watchlist chains  │
 │                                                                 │
-│  The internal channel state is fully on-chain — every sat        │
-│  movement is a kernel-validated, hash-chained CellToken.         │
+│  Why hub-and-spoke: bilateral A↔B channels can't handle 4       │
+│  players betting into a communal pot. If A bets and C wins,     │
+│  there's no A↔C channel. The table-as-hub model means each      │
+│  player has exactly 1 channel, and pot flow is always routed     │
+│  through the hub — no O(n²) channel pairs needed.               │
 │                                                                 │
 └──────────────────────┬──────────────────────────────────────────┘
                        │
@@ -184,6 +193,59 @@ The 2PDA kernel validates every transition against the compiled poker policies. 
 
 The dashboard shows caught vs undetected attempts in real-time, and the audit CSV includes every attempt with its CellToken hash.
 
+## Payment Channels — Hub-and-Spoke
+
+Traditional payment channels are bilateral: Alice opens a channel with Bob, they exchange signed state updates off-chain, and settle on-chain when done. This doesn't work for multi-player poker — when 4 players bet into a communal pot, you'd need O(n²) bilateral channels and there's no clean way to route pot winnings.
+
+We solve this with a **hub-and-spoke** architecture:
+
+```
+                    Table Engine (hub)
+                   /    |    |    \
+           2-of-2  2-of-2  2-of-2  2-of-2
+              /      |       |        \
+        Player 0  Player 1  Player 2  Player 3
+```
+
+Each player has exactly **one** channel with the table engine. The table acts as the pot custodian:
+
+| Action | Channel Flow | Direction |
+|---|---|---|
+| Player bets 100 sats | Tick on that player's channel | Player → Table |
+| Player calls 50 sats | Tick on that player's channel | Player → Table |
+| Player goes all-in | Tick on that player's channel | Player → Table |
+| Winner gets 400 pot | Tick on winner's channel | Table → Player |
+| Fold / Check | No tick (zero sats move) | — |
+
+Every tick produces an **HMAC-SHA256 tick proof** — a cryptographic receipt binding the channel ID, tick number, cumulative satoshis, and shared secret. These proofs are the audit trail:
+
+```
+TickProof {
+  channelId: "ch_a4f7x2k1q",
+  tick: 7,
+  cumulativeSatoshis: 450,
+  hmac: "3f8a91c2...",    // HMAC-SHA256(channelId:tick:sats, sharedSecret)
+  timestamp: 1713168000000
+}
+```
+
+Each channel runs through an **8-state FSM**:
+
+```
+NEGOTIATING → FUNDED → ACTIVE → PAUSED ↔ ACTIVE
+                                   ↓
+                         CLOSING_REQUESTED → CLOSING_CONFIRMED → SETTLED
+                                   ↓                    ↓
+                              DISPUTED ──────────→ SETTLED (via resolve)
+```
+
+At table close, all channels settle simultaneously. The settlement includes:
+- All tick proofs (HMAC-authenticated state chain)
+- Per-channel net flow (bets vs awards)
+- Final FSM state transition
+
+The hub-and-spoke design is **tested with 24 tests and 87 assertions** covering 2-player through 6-player tables, cumulative pot tracking, independent channel state per player, full settlement lifecycle, and callback integration with the table engine.
+
 ## Running It
 
 ### Prerequisites
@@ -261,6 +323,8 @@ open http://localhost:9090
 |---|---|---|---|
 | Floor CellTokens | ~2.5M | ~135 sats | 5 per hand × 128 tables × 2000 hands × restarts |
 | Floor OP_RETURNs | ~2.5M | ~30 sats | Anchor commitments |
+| Payment channel ticks | ~5M+ | ~135 sats | ~10 bets/hand × 128 tables × 2000+ hands |
+| Channel open/settle | ~1K | ~250 sats | 2-of-2 multisig fund + settle per table session |
 | Apex policy CellTokens | ~200 | ~135 sats | Per roam upgrade |
 | Cheat detection CellTokens | ~50 | ~135 sats | Rogue agent attempts |
 | Pre-split fan-outs | ~96 | ~3K sats | UTXO distribution |
@@ -294,7 +358,10 @@ Today the CellTokens use PushDrop for mainnet compatibility. When miners adopt t
 │   ├── border-router.ts             # Metrics API + dashboard
 │   ├── dashboard.html               # Live web UI (single-file, no build)
 │   ├── engine/                      # Game engine + bot personas
+│   │   ├── table-payment-hub       # Hub-and-spoke payment channels
+│   │   └── poker-table-engine      # Multi-player table runner
 │   ├── agent/                       # 20 agent modules
+│   │   ├── payment-channel          # 2-of-2 multisig channel manager
 │   │   ├── direct-broadcast-engine  # Batch ARC broadcasting
 │   │   ├── shadow-loop              # Training data observation
 │   │   ├── vulnerability-scorer     # Opponent analysis
@@ -306,6 +373,8 @@ Today the CellTokens use PushDrop for mainnet compatibility. When miners adopt t
 │   ├── policies/                    # Poker policies + Lisp compiler
 │   └── cell-engine/                 # Host function registry
 ├── opcodes/                         # Plexus VM (Zig + Lean4 + TLA+)
+├── test/                            # TDD test suite (bun test)
+│   └── table-payment-hub.test      # 24 tests, 87 assertions
 ├── scripts/                         # Funding, export, audit tools
 ├── Dockerfile                       # Multi-stage build
 └── docker-compose.yml               # Full 13-container swarm
