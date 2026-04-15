@@ -58,9 +58,9 @@
     <h2>System Stats</h2>
     <div id="stats">
       <div class="stat"><span class="label">Hands Played</span><span class="value" id="s-hands">—</span></div>
-      <div class="stat"><span class="label">On-Chain Txs</span><span class="value green" id="s-txs">—</span></div>
-      <div class="stat"><span class="label">CellTokens</span><span class="value" id="s-cells">—</span></div>
-      <div class="stat"><span class="label">Tx/sec</span><span class="value" id="s-tps">—</span></div>
+      <div class="stat"><span class="label">On-Chain CellTokens</span><span class="value green" id="s-cells">—</span></div>
+      <div class="stat"><span class="label">Kernel Validations</span><span class="value" id="s-txs">—</span></div>
+      <div class="stat"><span class="label">CellTokens/sec</span><span class="value" id="s-tps">—</span></div>
       <div class="stat"><span class="label">Hands/sec</span><span class="value" id="s-hps">—</span></div>
       <div class="stat"><span class="label">Uptime</span><span class="value" id="s-uptime">—</span></div>
       <div class="stat"><span class="label">Eliminations</span><span class="value red" id="s-elim">—</span></div>
@@ -159,10 +159,10 @@
 
   <!-- TPS Gauge -->
   <div class="card">
-    <h2>TPS Gauge</h2>
+    <h2>On-Chain CellTokens/sec</h2>
     <div id="tps-gauge">
-      <div class="stat"><span class="label">Current TPS</span><span class="value" id="tps-current">--</span></div>
-      <div class="stat"><span class="label">Peak TPS</span><span class="value gold" id="tps-peak">--</span></div>
+      <div class="stat"><span class="label">Current</span><span class="value" id="tps-current">--</span></div>
+      <div class="stat"><span class="label">Peak</span><span class="value gold" id="tps-peak">--</span></div>
       <div style="margin-top:10px;">
         <div style="font-size:0.75em; color:#7b7baa; margin-bottom:4px;">TPS History (last 30 samples)</div>
         <div id="tps-chart" style="display:flex; align-items:flex-end; height:60px; gap:2px;"></div>
@@ -260,18 +260,17 @@ async function fetchJSON(path) {
   try { const r = await fetch(BASE + path); return r.ok ? await r.json() : null; } catch { return null; }
 }
 
+let _lastUptime = 0;
 async function refreshStats() {
   const d = await fetchJSON('/api/stats');
   if (!d) return;
   document.getElementById('s-hands').textContent = fmt(d.totalHands);
-  document.getElementById('s-txs').textContent = fmt(d.totalTxCount);
+  document.getElementById('s-txs').textContent = fmt(d.totalTxCount); // kernel validations (internal)
   document.getElementById('s-elim').textContent = fmt(d.totalEliminations);
   document.getElementById('s-players').textContent = fmt(d.totalUniquePlayers);
-  const uptime = d.uptimeMs || (Date.now() - d.startTime);
-  document.getElementById('s-uptime').textContent = fmtTime(uptime);
-  const secs = (uptime || 1) / 1000;
-  document.getElementById('s-tps').textContent = (d.totalTxCount / secs).toFixed(1);
-  document.getElementById('s-hps').textContent = (d.totalHands / secs).toFixed(1);
+  _lastUptime = d.uptimeMs || (Date.now() - d.startTime);
+  document.getElementById('s-uptime').textContent = fmtTime(_lastUptime);
+  document.getElementById('s-hps').textContent = (d.totalHands / ((_lastUptime || 1) / 1000)).toFixed(1);
 }
 
 async function refreshCellStats() {
@@ -285,6 +284,11 @@ async function refreshCellStats() {
   document.getElementById('c-sources').textContent = fmt(d.uniqueSources);
   document.getElementById('s-cells').textContent = fmt(d.totalCells);
   document.getElementById('s-fees').textContent = fmtBSV(d.totalEstimatedFeeSats);
+  // Update CellTokens/sec using real on-chain count
+  const secs = (_lastUptime || 1) / 1000;
+  if (d.totalCells > 0 && secs > 1) {
+    document.getElementById('s-tps').textContent = (d.totalCells / secs).toFixed(1);
+  }
 
   if (d.phaseBreakdown) {
     const phases = Object.entries(d.phaseBreakdown).map(([k,v]) => `${k}:${v}`).join(' ');
@@ -664,11 +668,11 @@ const tpsHistory = [];
 let peakTps = 0;
 
 async function refreshTPSGauge() {
-  const d = await fetchJSON('/api/stats');
+  const d = await fetchJSON('/api/cells/stats');
   if (!d) return;
 
-  const uptime = d.uptimeMs || (Date.now() - d.startTime) || 1;
-  const currentTps = parseFloat((d.totalTxCount / (uptime / 1000)).toFixed(1));
+  const uptime = _lastUptime || 1;
+  const currentTps = parseFloat((d.totalCells / (uptime / 1000)).toFixed(1));
 
   tpsHistory.push(currentTps);
   if (tpsHistory.length > 30) tpsHistory.shift();
