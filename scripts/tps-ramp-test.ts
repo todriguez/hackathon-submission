@@ -46,10 +46,11 @@ const MAX_SATS          = parseInt(process.env.MAX_SATS ?? '1000000', 10);
 const SPLIT_SATS        = parseInt(process.env.SPLIT_SATS ?? '500', 10);
 const FEE_RATE          = parseFloat(process.env.FEE_RATE ?? '0.1');
 const MIN_FEE           = parseInt(process.env.MIN_FEE ?? '25', 10);
-const RAMP_STEP         = parseInt(process.env.RAMP_STEP ?? '1', 10);
+const RAMP_STEP         = parseInt(process.env.RAMP_STEP ?? '10', 10);
 const RAMP_INTERVAL_SEC = parseInt(process.env.RAMP_INTERVAL ?? '10', 10);
 const FAIL_THRESHOLD    = parseFloat(process.env.FAIL_THRESHOLD ?? '0.2');
 const MIN_BALANCE_SATS  = parseInt(process.env.MIN_BALANCE_SATS ?? '50000', 10);
+const BATCH_SIZE        = parseInt(process.env.BATCH_SIZE ?? '20', 10);
 
 const privKey = PrivateKey.fromWif(WIF);
 const pubKey  = privKey.toPublicKey();
@@ -150,21 +151,48 @@ console.log(`  ARC endpoint:  ${ARC_URL}`);
 console.log(`  Max spend:     ${MAX_SATS.toLocaleString()} sats (${(MAX_SATS / 1e8).toFixed(4)} BSV)`);
 console.log(`  Split size:    ${SPLIT_SATS} sats`);
 console.log(`  Fee rate:      ${FEE_RATE} sat/byte`);
+console.log(`  Batch size:    ${BATCH_SIZE} txs/batch (broadcastMany)`);
 console.log(`  Ramp:          +${RAMP_STEP} TPS every ${RAMP_INTERVAL_SEC}s`);
 console.log(`  Fail threshold: ${(FAIL_THRESHOLD * 100).toFixed(0)}%`);
 console.log('');
 
-log('FUND', 'Checking UTXOs via WhatsOnChain...');
+log('FUND', 'Checking UTXOs...');
 
-const utxoResp = await fetch(
+// Try WoC first, then GorillaPool ordinals API (WoC caps at 1000 results)
+let rawUtxos: any[] = [];
+
+const wocUtxoResp = await fetch(
   `https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`,
 );
-if (!utxoResp.ok) {
-  console.error(`  ERROR: WoC returned ${utxoResp.status}`);
-  process.exit(1);
+if (wocUtxoResp.ok) {
+  const wocUtxos: any[] = await wocUtxoResp.json();
+  rawUtxos = wocUtxos.map((u: any) => ({ tx_hash: u.tx_hash, tx_pos: u.tx_pos, value: u.value }));
+  log('FUND', `WoC: ${rawUtxos.length} UTXOs`);
 }
 
-const rawUtxos: any[] = await utxoResp.json();
+// If WoC hit 1000 cap or returned 0, try ordinals API for the full picture
+if (rawUtxos.length >= 999 || rawUtxos.length === 0) {
+  log('FUND', 'WoC capped at 1000 — trying GorillaPool ordinals API for full UTXO set...');
+  try {
+    const gpResp = await fetch(
+      `https://ordinals.gorillapool.io/api/txos/address/${address}/unspent?limit=10000`,
+    );
+    if (gpResp.ok) {
+      const gpUtxos: any[] = await gpResp.json();
+      // Normalize to WoC format
+      const gpNormalized = gpUtxos
+        .filter((u: any) => !u.spend) // unspent only
+        .map((u: any) => ({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }));
+      if (gpNormalized.length > rawUtxos.length) {
+        rawUtxos = gpNormalized;
+        log('FUND', `GorillaPool ordinals: ${rawUtxos.length} UTXOs (more complete)`);
+      }
+    }
+  } catch (e: any) {
+    log('FUND', `Ordinals API failed: ${e.message} — using WoC data`);
+  }
+}
+
 if (rawUtxos.length === 0) {
   console.error('  ERROR: No UTXOs found. Fund the address first!');
   console.error(`  Address: ${address}`);
@@ -172,7 +200,7 @@ if (rawUtxos.length === 0) {
 }
 
 const totalBalance = rawUtxos.reduce((s: number, u: any) => s + u.value, 0);
-log('FUND', `Found ${rawUtxos.length} UTXOs totaling ${totalBalance.toLocaleString()} sats (${(totalBalance / 1e8).toFixed(4)} BSV)`);
+log('FUND', `Total: ${rawUtxos.length} UTXOs, ${totalBalance.toLocaleString()} sats (${(totalBalance / 1e8).toFixed(4)} BSV)`);
 
 if (totalBalance < MIN_BALANCE_SATS) {
   console.error(`  ERROR: Balance ${totalBalance} sats is below minimum ${MIN_BALANCE_SATS} sats. Fund the address.`);
@@ -184,136 +212,169 @@ const budgetSats = Math.min(MAX_SATS, totalBalance);
 log('FUND', `Test budget: ${budgetSats.toLocaleString()} sats`);
 
 // ══════════════════════════════════════════════════════════════════
-// Phase 2: Pre-Split
+// Phase 2: Pre-Split (or reuse existing small UTXOs)
 // ══════════════════════════════════════════════════════════════════
-
-log('SPLIT', 'Fetching source transactions for signing...');
-
-// Gather funding inputs (fetch full tx hex for each UTXO)
-interface FundingInput {
-  txid: string;
-  vout: number;
-  sats: number;
-  sourceTx: Transaction;
-}
-
-const fundingInputs: FundingInput[] = [];
-let gatheredSats = 0;
-
-// Sort UTXOs largest first, gather enough to cover budget
-const sortedUtxos = rawUtxos.sort((a: any, b: any) => b.value - a.value);
-for (const u of sortedUtxos) {
-  if (gatheredSats >= budgetSats) break;
-  const txResp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${u.tx_hash}/hex`);
-  if (!txResp.ok) {
-    log('SPLIT', `Warning: could not fetch tx ${u.tx_hash}, skipping`);
-    continue;
-  }
-  const txHex = await txResp.text();
-  fundingInputs.push({
-    txid: u.tx_hash,
-    vout: u.tx_pos,
-    sats: u.value,
-    sourceTx: Transaction.fromHex(txHex),
-  });
-  gatheredSats += u.value;
-}
-
-if (fundingInputs.length === 0) {
-  console.error('  ERROR: Could not fetch any source transactions');
-  process.exit(1);
-}
-
-log('SPLIT', `Using ${fundingInputs.length} UTXOs (${gatheredSats.toLocaleString()} sats) for split`);
-
-// Calculate splits
-const INPUT_SIZE = 148;
-const OUTPUT_SIZE = 34;
-const OVERHEAD = 10;
-const splitFeeEst = Math.max(
-  MIN_FEE,
-  Math.ceil((OVERHEAD + fundingInputs.length * INPUT_SIZE + OUTPUT_SIZE * 2) * FEE_RATE),
-);
-const maxSplits = Math.floor(
-  (Math.min(gatheredSats, budgetSats) - splitFeeEst) / (SPLIT_SATS + Math.ceil(OUTPUT_SIZE * FEE_RATE)),
-);
-const numSplits = Math.max(1, Math.min(maxSplits, 2000)); // cap at 2000 to keep tx reasonable
-
-log('SPLIT', `Creating ${numSplits} UTXOs of ${SPLIT_SATS} sats each...`);
 
 const p2pkh = new P2PKH();
 const lockingScript = p2pkh.lock(address);
-const splitTx = new Transaction();
 
-for (const inp of fundingInputs) {
-  splitTx.addInput({
-    sourceTXID: inp.txid,
-    sourceOutputIndex: inp.vout,
-    sourceTransaction: inp.sourceTx,
-    unlockingScriptTemplate: p2pkh.unlock(privKey),
-  });
-}
+// Check: are there already enough small UTXOs from a previous split?
+const smallUtxos = rawUtxos.filter((u: any) => u.value <= SPLIT_SATS * 2 && u.value >= 200);
+const largeUtxos = rawUtxos.filter((u: any) => u.value > SPLIT_SATS * 2);
 
-for (let i = 0; i < numSplits; i++) {
-  splitTx.addOutput({ lockingScript, satoshis: SPLIT_SATS });
-}
+if (smallUtxos.length >= 50) {
+  // ── Reuse existing split UTXOs (skip re-splitting) ──
+  log('SPLIT', `Found ${smallUtxos.length} existing small UTXOs — reusing (no new split needed)`);
 
-// Change
-const totalSplitOut = numSplits * SPLIT_SATS;
-const splitFee = Math.max(
-  MIN_FEE,
-  Math.ceil((OVERHEAD + fundingInputs.length * INPUT_SIZE + OUTPUT_SIZE * (numSplits + 1)) * FEE_RATE),
-);
-const splitChange = gatheredSats - totalSplitOut - splitFee;
-if (splitChange > 546) {
-  splitTx.addOutput({ lockingScript, satoshis: splitChange });
-}
+  // Fetch source tx for the parent (all small UTXOs likely share the same parent tx)
+  const parentTxids = new Set<string>(smallUtxos.map((u: any) => u.tx_hash));
+  const parentTxCache = new Map<string, Transaction>();
 
-await splitTx.sign();
-const splitHex = splitTx.toHex();
-const splitTxid = splitTx.id('hex') as string;
+  for (const txid of parentTxids) {
+    try {
+      const txResp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`);
+      if (txResp.ok) {
+        parentTxCache.set(txid, Transaction.fromHex(await txResp.text()));
+      }
+    } catch {}
+  }
+  log('SPLIT', `Fetched ${parentTxCache.size} parent transactions for signing`);
 
-log('SPLIT', `Tx size: ${(splitHex.length / 2).toLocaleString()} bytes, fee: ${splitFee} sats`);
-log('SPLIT', 'Broadcasting split tx via ARC...');
+  // Cap to budget
+  let poolSats = 0;
+  for (const u of smallUtxos) {
+    if (poolSats >= budgetSats) break;
+    const sourceTx = parentTxCache.get(u.tx_hash);
+    if (!sourceTx) continue;
+    utxoPool.push({
+      txid: u.tx_hash,
+      vout: u.tx_pos,
+      satoshis: u.value,
+      sourceTx,
+    });
+    poolSats += u.value;
+  }
 
-const splitResult = await splitTx.broadcast(arc);
-if ('status' in splitResult && (splitResult as any).status === 'error') {
-  console.error(`  ERROR: ARC rejected split tx: ${JSON.stringify(splitResult)}`);
-  process.exit(1);
-}
+  log('SPLIT', `Pool ready: ${utxoPool.length} UTXOs (${poolSats.toLocaleString()} sats). No split fee.`);
 
-// WoC backup broadcast
-const wocResp = await fetch('https://api.whatsonchain.com/v1/bsv/main/tx/raw', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ txhex: splitHex }),
-});
-if (wocResp.ok) {
-  log('SPLIT', 'WoC backup broadcast confirmed');
 } else {
-  log('SPLIT', `WoC backup: ${wocResp.status} (non-critical)`);
-}
+  // ── Need to create a fresh split ──
+  log('SPLIT', 'Not enough small UTXOs — creating fresh split...');
+  log('SPLIT', 'Fetching source transactions for signing...');
 
-log('SPLIT', `Split tx: ${splitTxid}`);
-log('SPLIT', `  https://whatsonchain.com/tx/${splitTxid}`);
+  interface FundingInput {
+    txid: string;
+    vout: number;
+    sats: number;
+    sourceTx: Transaction;
+  }
 
-// Populate UTXO pool
-for (let i = 0; i < numSplits; i++) {
-  utxoPool.push({
-    txid: splitTxid,
-    vout: i,
-    satoshis: SPLIT_SATS,
-    sourceTx: splitTx,
+  const fundingInputs: FundingInput[] = [];
+  let gatheredSats = 0;
+
+  const sortedUtxos = rawUtxos.sort((a: any, b: any) => b.value - a.value);
+  for (const u of sortedUtxos) {
+    if (gatheredSats >= budgetSats) break;
+    const txResp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${u.tx_hash}/hex`);
+    if (!txResp.ok) {
+      log('SPLIT', `Warning: could not fetch tx ${u.tx_hash}, skipping`);
+      continue;
+    }
+    const txHex = await txResp.text();
+    fundingInputs.push({
+      txid: u.tx_hash,
+      vout: u.tx_pos,
+      sats: u.value,
+      sourceTx: Transaction.fromHex(txHex),
+    });
+    gatheredSats += u.value;
+  }
+
+  if (fundingInputs.length === 0) {
+    console.error('  ERROR: Could not fetch any source transactions');
+    process.exit(1);
+  }
+
+  log('SPLIT', `Using ${fundingInputs.length} UTXOs (${gatheredSats.toLocaleString()} sats) for split`);
+
+  const INPUT_SIZE = 148;
+  const OUTPUT_SIZE = 34;
+  const OVERHEAD = 10;
+  const splitFeeEst = Math.max(
+    MIN_FEE,
+    Math.ceil((OVERHEAD + fundingInputs.length * INPUT_SIZE + OUTPUT_SIZE * 2) * FEE_RATE),
+  );
+  const maxSplits = Math.floor(
+    (Math.min(gatheredSats, budgetSats) - splitFeeEst) / (SPLIT_SATS + Math.ceil(OUTPUT_SIZE * FEE_RATE)),
+  );
+  const numSplits = Math.max(1, Math.min(maxSplits, 2000));
+
+  log('SPLIT', `Creating ${numSplits} UTXOs of ${SPLIT_SATS} sats each...`);
+
+  const splitTx = new Transaction();
+  for (const inp of fundingInputs) {
+    splitTx.addInput({
+      sourceTXID: inp.txid,
+      sourceOutputIndex: inp.vout,
+      sourceTransaction: inp.sourceTx,
+      unlockingScriptTemplate: p2pkh.unlock(privKey),
+    });
+  }
+  for (let i = 0; i < numSplits; i++) {
+    splitTx.addOutput({ lockingScript, satoshis: SPLIT_SATS });
+  }
+
+  const totalSplitOut = numSplits * SPLIT_SATS;
+  const splitFee = Math.max(
+    MIN_FEE,
+    Math.ceil((OVERHEAD + fundingInputs.length * INPUT_SIZE + OUTPUT_SIZE * (numSplits + 1)) * FEE_RATE),
+  );
+  const splitChange = gatheredSats - totalSplitOut - splitFee;
+  if (splitChange > 546) {
+    splitTx.addOutput({ lockingScript, satoshis: splitChange });
+  }
+
+  await splitTx.sign();
+  const splitHex = splitTx.toHex();
+  const splitTxid = splitTx.id('hex') as string;
+
+  log('SPLIT', `Tx size: ${(splitHex.length / 2).toLocaleString()} bytes, fee: ${splitFee} sats`);
+  log('SPLIT', 'Broadcasting split tx via ARC...');
+
+  const splitResult = await splitTx.broadcast(arc);
+  if ('status' in splitResult && (splitResult as any).status === 'error') {
+    console.error(`  ERROR: ARC rejected split tx: ${JSON.stringify(splitResult)}`);
+    process.exit(1);
+  }
+
+  const wocResp = await fetch('https://api.whatsonchain.com/v1/bsv/main/tx/raw', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ txhex: splitHex }),
   });
+  if (wocResp.ok) log('SPLIT', 'WoC backup broadcast confirmed');
+  else log('SPLIT', `WoC backup: ${wocResp.status} (non-critical)`);
+
+  log('SPLIT', `Split tx: ${splitTxid}`);
+  log('SPLIT', `  https://whatsonchain.com/tx/${splitTxid}`);
+
+  for (let i = 0; i < numSplits; i++) {
+    utxoPool.push({
+      txid: splitTxid,
+      vout: i,
+      satoshis: SPLIT_SATS,
+      sourceTx: splitTx,
+    });
+  }
+
+  totalSatsSpent += splitFee;
+  log('SPLIT', `Pool ready: ${utxoPool.length} UTXOs. Fees so far: ${totalSatsSpent} sats`);
+
+  log('RAMP', 'Waiting 3s for split tx propagation...');
+  await new Promise(r => setTimeout(r, 3000));
 }
 
-totalSatsSpent += splitFee;
-log('SPLIT', `Pool ready: ${utxoPool.length} UTXOs. Fees so far: ${totalSatsSpent} sats`);
 console.log('');
-
-// Small delay to let the split tx propagate before we start spending its outputs
-log('RAMP', 'Waiting 3s for split tx propagation...');
-await new Promise(r => setTimeout(r, 3000));
 
 // ══════════════════════════════════════════════════════════════════
 // Phase 3: Ramp-Up Broadcast Test
@@ -326,13 +387,11 @@ let globalSeq = 0;
 let maxSustainableTps = 0;
 
 /**
- * Broadcast a single OP_RETURN test tx.
- * Returns { success, latencyMs, fee } or throws.
+ * Build a signed OP_RETURN tx ready for batch broadcast.
+ * Returns the signed Transaction + metadata, or null if pool empty.
  */
-async function broadcastOne(): Promise<{ success: boolean; latencyMs: number; fee: number; error?: string }> {
-  if (utxoPool.length === 0) {
-    return { success: false, latencyMs: 0, fee: 0, error: 'no UTXOs left' };
-  }
+async function buildTx(): Promise<{ tx: Transaction; fee: number; change: number; fundingSats: number } | null> {
+  if (utxoPool.length === 0) return null;
 
   const funding = utxoPool.shift()!;
   const seq = globalSeq++;
@@ -348,13 +407,11 @@ async function broadcastOne(): Promise<{ success: boolean; latencyMs: number; fe
     unlockingScriptTemplate: p2pkh.unlock(privKey),
   });
 
-  // OP_RETURN output (0 sats -- unspendable)
   tx.addOutput({
     lockingScript: opReturnScript,
     satoshis: 0,
   });
 
-  // Change back to pool
   const change = funding.satoshis - fee;
   if (change > 546) {
     tx.addOutput({
@@ -364,37 +421,86 @@ async function broadcastOne(): Promise<{ success: boolean; latencyMs: number; fe
   }
 
   await tx.sign();
+  return { tx, fee, change, fundingSats: funding.satoshis };
+}
 
+/**
+ * Broadcast a batch of signed txs via arc.broadcastMany() — one HTTP round-trip.
+ * Returns per-tx results.
+ */
+async function broadcastBatch(txs: { tx: Transaction; fee: number; change: number }[]): Promise<{
+  successes: number; failures: number; latencyMs: number; feesSpent: number; errors: string[];
+}> {
+  const t0 = Date.now();
+  const result = { successes: 0, failures: 0, latencyMs: 0, feesSpent: 0, errors: [] as string[] };
+
+  try {
+    const rawTxs = txs.map(t => t.tx);
+    const responses: any[] = await arc.broadcastMany(rawTxs);
+    result.latencyMs = Date.now() - t0;
+
+    for (let i = 0; i < responses.length; i++) {
+      const r = responses[i];
+      if (r?.status === 'error' || r?.txStatus === 'REJECTED') {
+        result.failures++;
+        const errMsg = r?.detail || r?.description || JSON.stringify(r);
+        result.errors.push(errMsg);
+      } else {
+        result.successes++;
+        result.feesSpent += txs[i].fee;
+        totalSatsSpent += txs[i].fee;
+
+        // Recycle change UTXO back into pool
+        if (txs[i].change > 546) {
+          const txid = txs[i].tx.id('hex') as string;
+          utxoPool.push({
+            txid,
+            vout: 1,
+            satoshis: txs[i].change,
+            sourceTx: txs[i].tx,
+          });
+        }
+      }
+    }
+  } catch (err: any) {
+    result.latencyMs = Date.now() - t0;
+    result.failures = txs.length;
+    result.errors.push(err.message);
+  }
+
+  return result;
+}
+
+/**
+ * Legacy single-tx broadcast (fallback for batch size 1).
+ */
+async function broadcastOne(built: { tx: Transaction; fee: number; change: number }): Promise<{
+  successes: number; failures: number; latencyMs: number; feesSpent: number; errors: string[];
+}> {
   const t0 = Date.now();
   try {
-    const result = await tx.broadcast(arc);
+    const r = await built.tx.broadcast(arc);
     const latencyMs = Date.now() - t0;
 
-    if ('status' in result && (result as any).status === 'error') {
-      return { success: false, latencyMs, fee, error: JSON.stringify(result) };
+    if ('status' in r && (r as any).status === 'error') {
+      return { successes: 0, failures: 1, latencyMs, feesSpent: 0, errors: [JSON.stringify(r)] };
     }
 
-    // Recycle change UTXO back into pool
-    if (change > 546) {
-      const txid = tx.id('hex') as string;
-      utxoPool.push({
-        txid,
-        vout: 1, // change is output index 1
-        satoshis: change,
-        sourceTx: tx,
-      });
+    totalSatsSpent += built.fee;
+    if (built.change > 546) {
+      const txid = built.tx.id('hex') as string;
+      utxoPool.push({ txid, vout: 1, satoshis: built.change, sourceTx: built.tx });
     }
-
-    totalSatsSpent += fee;
-    return { success: true, latencyMs, fee };
+    return { successes: 1, failures: 0, latencyMs, feesSpent: built.fee, errors: [] };
   } catch (err: any) {
-    const latencyMs = Date.now() - t0;
-    return { success: false, latencyMs, fee: 0, error: err.message };
+    return { successes: 0, failures: 1, latencyMs: Date.now() - t0, feesSpent: 0, errors: [err.message] };
   }
 }
 
 /**
  * Run one ramp level: attempt `targetTps` tx/sec for `durationSec` seconds.
+ * Uses batch broadcasting: builds `targetTps` txs, then broadcasts in batches of BATCH_SIZE.
+ * This means we send ceil(targetTps / BATCH_SIZE) HTTP requests per second, not targetTps.
  */
 async function runLevel(targetTps: number, durationSec: number): Promise<LevelStats> {
   const stats: LevelStats = {
@@ -408,58 +514,65 @@ async function runLevel(targetTps: number, durationSec: number): Promise<LevelSt
     feesSpent: 0,
   };
 
-  const intervalMs = 1000 / targetTps;
+  const batchesPerSec = Math.ceil(targetTps / BATCH_SIZE);
+  const txsPerBatch = Math.min(targetTps, BATCH_SIZE);
+  const intervalMs = 1000 / batchesPerSec;
   const levelStart = Date.now();
   const levelEnd = levelStart + durationSec * 1000;
 
-  // We send transactions spaced by intervalMs, collecting results
+  log('RAMP', `  Batching: ${txsPerBatch} txs/batch × ${batchesPerSec} batches/sec = ${txsPerBatch * batchesPerSec} tx/sec target`);
+
   const pending: Promise<void>[] = [];
   let nextSendTime = levelStart;
 
   while (Date.now() < levelEnd && !aborted) {
-    // Budget check
     if (totalSatsSpent >= MAX_SATS) {
       log('RAMP', 'MAX_SATS budget reached -- stopping');
       aborted = true;
       break;
     }
-
-    // UTXO check
-    if (utxoPool.length === 0) {
-      log('RAMP', 'UTXO pool exhausted -- stopping');
+    if (utxoPool.length < txsPerBatch) {
+      log('RAMP', `UTXO pool low (${utxoPool.length}) -- stopping`);
       aborted = true;
       break;
     }
 
     const now = Date.now();
     if (now < nextSendTime) {
-      // Wait until next slot
       await new Promise(r => setTimeout(r, Math.max(1, nextSendTime - now)));
     }
     nextSendTime = Date.now() + intervalMs;
 
-    stats.attempts++;
-    // Fire broadcast (don't await individually -- track in pending)
-    const p = broadcastOne().then(r => {
-      if (r.success) {
-        stats.successes++;
-        stats.feesSpent += r.fee;
-      } else {
-        stats.failures++;
-        if (r.error && stats.failures <= 3) {
-          log('RAMP', `  Fail: ${r.error.slice(0, 120)}`);
-        }
-      }
+    // Build a batch of signed txs
+    const batch: { tx: Transaction; fee: number; change: number }[] = [];
+    for (let i = 0; i < txsPerBatch; i++) {
+      const built = await buildTx();
+      if (!built) break;
+      batch.push(built);
+    }
+    if (batch.length === 0) break;
+
+    stats.attempts += batch.length;
+
+    // Broadcast the batch (one HTTP request for N txs)
+    const p = (batch.length === 1
+      ? broadcastOne(batch[0])
+      : broadcastBatch(batch)
+    ).then(r => {
+      stats.successes += r.successes;
+      stats.failures += r.failures;
+      stats.feesSpent += r.feesSpent;
       stats.totalLatencyMs += r.latencyMs;
       stats.minLatencyMs = Math.min(stats.minLatencyMs, r.latencyMs);
       stats.maxLatencyMs = Math.max(stats.maxLatencyMs, r.latencyMs);
+      if (r.errors.length > 0 && stats.failures <= 5) {
+        log('RAMP', `  Fail (${r.failures}/${batch.length}): ${r.errors[0].slice(0, 120)}`);
+      }
     });
     pending.push(p);
   }
 
-  // Wait for all in-flight broadcasts to settle
   await Promise.allSettled(pending);
-
   if (stats.minLatencyMs === Infinity) stats.minLatencyMs = 0;
   return stats;
 }
