@@ -303,6 +303,67 @@ At table close, all channels settle simultaneously. The settlement includes:
 
 The hub-and-spoke design is **tested with 24 tests and 87 assertions** covering 2-player through 6-player tables, cumulative pot tracking, independent channel state per player, full settlement lifecycle, and callback integration with the table engine.
 
+## IPv6 Multicast — Peer Discovery & Cell Propagation
+
+Floor nodes and apex predators don't talk through a central server — they communicate via **IPv6 UDP multicast** using CoAP-like framing. Each node joins a multicast group, discovers peers via heartbeats, and propagates CellTokens and control messages across the mesh in real-time.
+
+### How It Works
+
+```
+Node 0 (floor)                    Node 1 (floor)                    Node 2 (apex)
+    │                                  │                                  │
+    ├── heartbeat (botIndex=0) ───────→│←─────── heartbeat (botIndex=1) ──┤
+    │←─────── heartbeat (botIndex=1) ──┤── heartbeat (botIndex=2) ───────→│
+    │                                  │                                  │
+    │   Peers: [1, 2]                  │   Peers: [0, 2]                  │   Peers: [0, 1]
+    │                                  │                                  │
+    ├── publish(CellToken) ───────────→│←──── (received + stored) ────────┤
+    │                                  │──── publish(CellToken) ─────────→│
+```
+
+**Protocol details:**
+- **12-byte CoAP-like header**: version (1 byte), message type (1 byte), token length (2 bytes), bot index (2 bytes), sequence number (2 bytes), payload length (4 bytes)
+- **Message types**: `0x01` heartbeat (peer discovery), `0x02` cell publication, `0x03` control message
+- **CBOR serialization** for payloads (compact binary encoding)
+- **BCA derivation**: each node derives a deterministic IPv6 address from its bot index (`deriveBCA(index)`)
+
+### Peer Discovery
+
+Nodes emit heartbeats on startup and at configurable intervals. When a node receives a heartbeat from an unknown peer, it adds it to its peer table. Stale peers (no heartbeat within the timeout window) are automatically evicted.
+
+Self-suppression prevents nodes from discovering themselves as peers — heartbeats from the same bot index are silently dropped.
+
+### Control Messages
+
+Beyond cell propagation, nodes exchange structured control messages for coordination:
+
+| Control Type | Purpose | Flow |
+|---|---|---|
+| `TABLE_PROPOSAL` | Floor node proposes forming a table | Broadcast |
+| `TABLE_ACK` | Peer accepts the table proposal | Unicast to proposer |
+| `TABLE_CONFIRM` | Proposer confirms the table is formed | Broadcast to participants |
+
+This three-phase protocol enables **decentralized table formation** — no central coordinator assigns players to tables. Nodes discover each other via multicast, negotiate table composition, and confirm formation, all over UDP.
+
+### Unicast + Resolution
+
+In addition to multicast, nodes can send messages directly to a specific peer via `sendToNode(targetBotIndex, message)`. Peers are resolved by their BCA (Bot Cell Address) using `resolveBCA(ipv6Address)`, which maps IPv6 addresses back to peer metadata.
+
+### Testing
+
+The multicast layer is **tested with 23 tests and 73 assertions** covering:
+- Header encode/decode round-tripping (all message types, max values)
+- BCA derivation (determinism, correctness)
+- Peer discovery (2-node, 3-node mesh, self-suppression)
+- Cell publication and cross-node reception (delivery, storage, self-filtering)
+- Topic-based subscription (filtering, unsubscribe)
+- Control messages (delivery, three-phase table formation protocol)
+- Unicast to specific peers + BCA resolution
+- 4-node mesh simulation (full connectivity)
+- Concurrent publications from multiple nodes
+
+All tests use `LoopbackUdpTransport` — an in-process test double that shares the exact same interface as `RealUdpTransport` (node:dgram sockets). The loopback transport routes messages through a shared registry with `queueMicrotask` for async delivery fidelity, proving the multicast logic works without requiring real UDP sockets.
+
 ## Running It
 
 ### Prerequisites
@@ -430,12 +491,16 @@ Today the CellTokens use PushDrop for mainnet compatibility. When miners adopt t
 │   │   ├── policy-evolution-chain   # Hash-chained policy history
 │   │   └── ...
 │   ├── protocol/                    # CellToken protocol (self-contained)
+│   │   └── adapters/               # Network adapters
+│   │       ├── docker-multicast-adapter  # IPv6 UDP multicast + CoAP framing
+│   │       └── udp-transport       # Loopback (test) + Real (dgram) transports
 │   ├── policies/                    # Poker policies + Lisp compiler
 │   └── cell-engine/                 # Host function registry
 ├── opcodes/                         # Plexus VM (Zig + Lean4 + TLA+)
 ├── test/                            # TDD test suite (bun test)
 │   ├── table-payment-hub.test      # 24 tests, 87 assertions
-│   └── paskian.test                # 26 tests, 64 assertions
+│   ├── paskian.test                # 26 tests, 64 assertions
+│   └── multicast.test              # 23 tests, 73 assertions
 ├── scripts/                         # Funding, export, audit tools
 ├── Dockerfile                       # Multi-stage build
 └── docker-compose.yml               # Full 13-container swarm
