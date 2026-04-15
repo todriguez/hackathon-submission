@@ -1506,7 +1506,7 @@ const server = Bun.serve({
     // Reads per-container CSVs from /audit/ volume and merges them
     if (url.pathname === '/api/audit/export' && req.method === 'GET') {
       try {
-        const auditDir = process.env.AUDIT_LOG_DIR ?? '/audit';
+        const auditDir = process.env.AUDIT_LOG_DIR ?? 'data';
         const glob = new Bun.Glob('txids-*.csv');
         const files: string[] = [];
         for await (const path of glob.scan(auditDir)) {
