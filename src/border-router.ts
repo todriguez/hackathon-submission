@@ -524,6 +524,7 @@ console.log(`[BorderRouter] Starting on ports ${METRICS_PORT} (HTTP) and ${WS_PO
 // Main HTTP + WS server on METRICS_PORT
 const server = Bun.serve({
   port: METRICS_PORT,
+  idleTimeout: 120, // 2 min — needed for Anthropic API report generation
   async fetch(req, server) {
     const url = new URL(req.url);
 
@@ -836,6 +837,7 @@ const server = Bun.serve({
         matchups: agentMatchups,
         total: agentMatchups.length,
         headToHead: computeHeadToHead(),
+        knownApex: [...knownApexIds],
       }, { headers: corsHeaders });
     }
 

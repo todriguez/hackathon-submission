@@ -880,6 +880,16 @@ async function main() {
   shadowLoop.start();
   console.log(`[${APEX_ID}] Shadow loop active (${SHADOW_INTERVAL}ms cadence)`);
 
+  // Register as apex agent with border-router for matchup tracking
+  try {
+    await fetch(`${ROUTER_URL}/api/register-apex`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apexId: APEX_ID, model: LLM_MODEL, provider: LLM_PROVIDER }),
+    });
+    console.log(`[${APEX_ID}] Registered with border-router (model=${LLM_MODEL})`);
+  } catch {}
+
   console.log(`[${APEX_ID}] Waiting for floor data (${MIN_HANDS_FOR_SCORING} hands minimum)...`);
   await new Promise((r) => setTimeout(r, 5000));
 
@@ -978,6 +988,34 @@ async function main() {
           model: LLM_MODEL,
         }),
       });
+    } catch {}
+
+    // Report agent matchups — check if other apex agents were at this table
+    try {
+      const matchResp = await fetch(`${ROUTER_URL}/api/agent-matchups`);
+      if (matchResp.ok) {
+        const matchData = await matchResp.json();
+        const otherApex = [...(matchData.knownApex ?? [])].filter((id: string) => id !== APEX_ID);
+        // If other apex agents are registered, report this as an agent-vs-agent encounter
+        for (const otherId of otherApex) {
+          await fetch(`${ROUTER_URL}/api/agent-matchup`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              agent1: APEX_ID,
+              agent2: otherId,
+              tableId: target.tableId,
+              handNumber: totalHands,
+              winner: result.chipsWon > 0 ? APEX_ID : otherId,
+              pot: Math.abs(result.chipsWon),
+              agent1Model: LLM_MODEL,
+              agent2Model: undefined, // router will fill from registry
+              timestamp: Date.now(),
+              policyVersion: swapper.getCurrentPolicy().version,
+            }),
+          });
+        }
+      }
     } catch {}
 
     // Publish settlement via MessageBox

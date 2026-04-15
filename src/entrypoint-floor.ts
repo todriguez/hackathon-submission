@@ -490,8 +490,12 @@ async function main() {
     }
   }
 
-  // Log broadcast stats if live
+  // Drain all pending broadcast promises before exiting
   if (broadcastEngine) {
+    console.log(`[casino-floor-${BOT_INDEX}] Flushing pending broadcasts...`);
+    const flushResult = await broadcastEngine.flush();
+    console.log(`[casino-floor-${BOT_INDEX}] Flushed: ${flushResult.settled} settled, ${flushResult.errors} errors`);
+
     const stats = broadcastEngine.getStats();
     console.log(`[casino-floor-${BOT_INDEX}] Broadcast stats: ${stats.totalBroadcast} txs, ${stats.avgBroadcastMs}ms avg, ${stats.txPerSec} tx/sec`);
     if (stats.errors.length > 0) {
@@ -518,8 +522,16 @@ async function main() {
   process.exit(0);
 }
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+async function gracefulShutdown(signal: string) {
+  console.log(`[casino-floor-${BOT_INDEX}] ${signal} received, flushing pending broadcasts...`);
+  if (broadcastEngine) {
+    const result = await broadcastEngine.flush();
+    console.log(`[casino-floor-${BOT_INDEX}] Flushed: ${result.settled} settled, ${result.errors} errors`);
+  }
+  process.exit(0);
+}
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 main().catch((err) => {
   console.error(`[casino-floor-${BOT_INDEX}] Fatal:`, err);

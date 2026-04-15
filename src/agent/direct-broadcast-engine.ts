@@ -918,8 +918,9 @@ export class DirectBroadcastEngine {
   }
 
   /**
-   * Flush the current batch queue to ARC via broadcastMany().
-   * Runs in the background — errors are logged, not thrown.
+   * Flush the current batch queue to ARC using direct fetch (bypasses @bsv/sdk).
+   * The SDK's broadcastMany uses Node's https module which silently fails under Bun.
+   * Direct fetch is reliable and gives us proper error reporting.
    */
   private flushBatch(): void {
     if (this.batchFlushTimer) {
@@ -934,31 +935,56 @@ export class DirectBroadcastEngine {
     const p = (async () => {
       const t0 = Date.now();
       try {
-        // Primary: ARC batch broadcast
-        const results: any[] = await this.arc.broadcastMany(batch);
+        // Serialize txs to EF hex (includes source transactions for SPV)
+        const rawTxs = batch.map(tx => {
+          try { return { rawTx: tx.toHexEF() }; }
+          catch { return { rawTx: tx.toHex() }; }
+        });
+
+        // Direct fetch to ARC batch endpoint (bypasses broken SDK httpClient)
+        const arcUrl = this.config.arcUrl;
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (this.config.arcApiKey) headers['Authorization'] = `Bearer ${this.config.arcApiKey}`;
+
+        const resp = await fetch(`${arcUrl}/v1/txs`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(rawTxs),
+        });
+
         const elapsed = Date.now() - t0;
         this.totalBroadcastMs += elapsed;
+
+        if (!resp.ok) {
+          const errBody = await resp.text().catch(() => '');
+          throw new Error(`ARC batch HTTP ${resp.status}: ${errBody.slice(0, 200)}`);
+        }
+
+        const results: any[] = await resp.json();
+        if (!Array.isArray(results)) {
+          throw new Error(`ARC batch returned non-array: ${JSON.stringify(results).slice(0, 200)}`);
+        }
 
         let ok = 0;
         let fail = 0;
         for (const r of results) {
-          if (r?.status === 'error' || r?.txStatus === 'REJECTED') {
+          const isError = r?.status === 'error' || r?.txStatus === 'REJECTED'
+            || (typeof r?.status === 'number' && r.status >= 400);
+          if (isError) {
             fail++;
-            this.errors.push(`Batch broadcast failed: ${r?.detail || r?.description || JSON.stringify(r)}`);
+            this.errors.push(`Batch tx failed: ${r?.title || r?.detail || r?.description || JSON.stringify(r).slice(0, 150)}`);
           } else {
             ok++;
           }
         }
-        if (fail > 0) {
-          this.log('BATCH', `Batch #${batchNum}: ${ok} ok, ${fail} failed in ${elapsed}ms`);
+        // Log first few batches + any failures
+        if (batchNum <= 2 || fail > 0) {
+          this.log('BATCH', `Batch #${batchNum}: ${ok} ok, ${fail} failed in ${elapsed}ms — sample: ${JSON.stringify(results[0]).slice(0, 200)}`);
         }
-
-        // WoC backup NOT used for bulk CellTokens — rate limited to 3/sec.
-        // ARC is reliable for CellTokens since the parent split is already propagated via WoC.
       } catch (err: any) {
         this.errors.push(`Batch broadcast error: ${err.message}`);
         this.log('BATCH', `Batch #${batchNum} error: ${err.message} — falling back to individual ARC`);
-        // Fallback: try each tx individually via ARC
+        // Fallback: try each tx individually via SDK (uses single /v1/tx endpoint)
         for (const tx of batch) {
           try {
             await tx.broadcast(this.arc);
