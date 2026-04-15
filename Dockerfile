@@ -28,9 +28,10 @@ FROM oven/bun:1-alpine AS runtime
 RUN addgroup -g 1001 semantos && \
     adduser -u 1001 -G semantos -s /sbin/nologin -D semantos
 
-RUN mkdir -p /var/semantos/data /audit && \
+RUN mkdir -p /var/semantos/data /audit /app/data && \
     chown -R semantos:semantos /var/semantos && \
-    chown semantos:semantos /audit
+    chown semantos:semantos /audit && \
+    chown semantos:semantos /app/data
 
 WORKDIR /app
 

@@ -67,7 +67,11 @@ console.log(`[casino-floor-${BOT_INDEX}] Host functions registered: ${registry.l
 // ── Broadcast Engine (live mode) ──
 
 let broadcastEngine: DirectBroadcastEngine | null = null;
-const FUNDING_TX_HEX = process.env.FUNDING_TX_HEX ?? '';
+import { readFileSync, existsSync } from 'fs';
+const FUNDING_TX_HEX = process.env.FUNDING_TX_HEX
+  || (process.env.FUNDING_TX_HEX_FILE && existsSync(process.env.FUNDING_TX_HEX_FILE)
+    ? readFileSync(process.env.FUNDING_TX_HEX_FILE, 'utf-8').trim()
+    : '');
 const FUNDING_VOUT = Number(process.env.FUNDING_VOUT ?? '0');
 const PRIVATE_KEY_WIF = process.env.PRIVATE_KEY_WIF ?? '';
 const CHANGE_ADDRESS = process.env.CHANGE_ADDRESS ?? '';
@@ -82,6 +86,8 @@ async function initBroadcastEngine(): Promise<void> {
     feeRate: FEE_RATE_SAT_PER_BYTE,
     minFee: MIN_FEE_SATS,
     splitSatoshis: SPLIT_SATS,
+    arcUrl: process.env.ARC_URL || undefined,
+    arcApiKey: process.env.ARC_API_KEY || undefined,
     // All containers share one key — fund once, done
     privateKeyWif: PRIVATE_KEY_WIF || undefined,
   });
@@ -97,16 +103,35 @@ async function initBroadcastEngine(): Promise<void> {
     console.log(`[casino-floor-${BOT_INDEX}] Change sweep to: ${CHANGE_ADDRESS}`);
   }
 
-  if (FUNDING_TX_HEX) {
-    // Ingest pre-provided funding tx
-    const funding = await broadcastEngine.ingestFunding(FUNDING_TX_HEX, FUNDING_VOUT);
-    await broadcastEngine.preSplit(funding);
-    console.log(`[casino-floor-${BOT_INDEX}] Pre-split complete — broadcasting via ARC`);
-  } else {
-    // Wait for external funding
+  // Strategy: try discovering existing on-chain UTXOs first (from previous runs).
+  // Only fall back to pre-split if no UTXOs found.
+  const TOTAL_FLOOR_NODES = 8;
+  let funded = false;
+  try {
+    const discovered = await broadcastEngine.discoverUtxos(BOT_INDEX, TOTAL_FLOOR_NODES);
+    if (discovered.count >= TABLES_PER_NODE) {
+      console.log(`[casino-floor-${BOT_INDEX}] Using ${discovered.count} discovered UTXOs (${discovered.totalSats.toLocaleString()} sats)`);
+      funded = true;
+    }
+  } catch (discErr: any) {
+    console.log(`[casino-floor-${BOT_INDEX}] UTXO discovery: ${discErr.message}`);
+  }
+
+  if (!funded && FUNDING_TX_HEX) {
+    try {
+      const funding = await broadcastEngine.ingestFunding(FUNDING_TX_HEX, FUNDING_VOUT);
+      await broadcastEngine.preSplit(funding);
+      console.log(`[casino-floor-${BOT_INDEX}] Pre-split complete — broadcasting via ARC + WoC`);
+      funded = true;
+    } catch (splitErr: any) {
+      console.log(`[casino-floor-${BOT_INDEX}] Pre-split failed: ${splitErr.message}`);
+    }
+  }
+
+  if (!funded) {
     const funding = await broadcastEngine.waitForFunding(300_000);
     await broadcastEngine.preSplit(funding);
-    console.log(`[casino-floor-${BOT_INDEX}] Funded and pre-split — broadcasting via ARC`);
+    console.log(`[casino-floor-${BOT_INDEX}] Funded and pre-split — broadcasting via ARC + WoC`);
   }
 }
 
@@ -128,9 +153,45 @@ async function initMulticast(): Promise<void> {
   }
 }
 
-// ── Router Reporting ──
+// ── Telemetry Batching ──
+// Accumulate all telemetry in-memory, flush to router once per second.
+// This reduces TCP connections from 640+/sec to 8/sec (one per floor node).
 
-async function reportHand(
+interface TelemetryBatch {
+  hands: any[];
+  playerStats: any[];
+  swarmEma: any[];
+  cells: any[];
+  eliminations: any[];
+  premiumHands: any[];
+}
+
+let telemetryBatch: TelemetryBatch = { hands: [], playerStats: [], swarmEma: [], cells: [], eliminations: [], premiumHands: [] };
+let telemetryFlushInFlight = false;
+
+const TELEMETRY_FLUSH_MS = 1000;
+
+const telemetryFlushInterval = setInterval(() => {
+  const batch = telemetryBatch;
+  const hasData = batch.hands.length || batch.playerStats.length || batch.swarmEma.length
+    || batch.cells.length || batch.eliminations.length || batch.premiumHands.length;
+  if (!hasData || telemetryFlushInFlight) return;
+
+  telemetryBatch = { hands: [], playerStats: [], swarmEma: [], cells: [], eliminations: [], premiumHands: [] };
+  telemetryFlushInFlight = true;
+
+  fetch(`${ROUTER_URL}/api/batch-telemetry`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceId: `floor-${BOT_INDEX}`, ...batch }),
+  })
+    .catch(() => {})
+    .finally(() => { telemetryFlushInFlight = false; });
+}, TELEMETRY_FLUSH_MS);
+
+// ── Router Reporting (batched) ──
+
+function reportHand(
   tableId: string,
   seats: SeatState[],
   winner: SeatState,
@@ -138,7 +199,7 @@ async function reportHand(
   actions: Array<{ playerId: string; action: PokerAction; amount: number; phase: string; validated: boolean; policyName: string }>,
   handNumber: number,
   txCount: number,
-): Promise<void> {
+): void {
   const hand = {
     id: `${tableId}-hand-${handNumber}`,
     myBotId: winner.identity.playerId,
@@ -157,50 +218,38 @@ async function reportHand(
     winner: winner.identity.playerId,
   };
 
-  try {
-    await fetch(`${ROUTER_URL}/api/hands`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hand, txCount, potSize, tableId }),
-    });
-  } catch {}
+  telemetryBatch.hands.push({ hand, txCount, potSize, tableId });
 
-  // Publish hand result on multicast
+  // Publish hand result on multicast (still direct — UDP, no overhead)
   if (multicast) {
     try {
       const cellBytes = new TextEncoder().encode(JSON.stringify({ tableId, handNumber, winner: winner.identity.playerId, pot: potSize }));
-      await multicast.publish({
+      multicast.publish({
         cellBytes,
         semanticPath: `game/poker/${tableId}/hand-${handNumber}/result`,
         contentHash: '',
         ownerCert: '',
         typeHash: 'poker-hand-result',
-      }, { topic: `table/${tableId}/hands` });
+      }, { topic: `table/${tableId}/hands` }).catch(() => {});
     } catch {}
   }
 }
 
-async function reportPlayerStats(
+function reportPlayerStats(
   tableId: string,
   seats: SeatState[],
   handsPlayed: number,
-): Promise<void> {
-  try {
-    await fetch(`${ROUTER_URL}/api/player-stats`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tableId,
-        players: seats.map((s) => ({
-          playerId: s.identity.playerId,
-          persona: s.identity.persona.name,
-          chips: s.chips,
-          chipDelta: s.chips - STARTING_CHIPS,
-          handsPlayed,
-        })),
-      }),
-    });
-  } catch {}
+): void {
+  telemetryBatch.playerStats.push({
+    tableId,
+    players: seats.map((s) => ({
+      playerId: s.identity.playerId,
+      persona: s.identity.persona.name,
+      chips: s.chips,
+      chipDelta: s.chips - STARTING_CHIPS,
+      handsPlayed,
+    })),
+  });
 }
 
 // ── Table Runner ──
@@ -276,12 +325,7 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
     enableSwarmEMA: true,
     swarmEMAAlpha: 0.05,
     onSwarmUpdate: (snapshots) => {
-      // Report EMA state to router for Paskian to observe
-      fetch(`${ROUTER_URL}/api/swarm-ema`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tableId, snapshots, timestamp: Date.now() }),
-      }).catch(() => {});
+      telemetryBatch.swarmEma.push({ tableId, snapshots, timestamp: Date.now() });
     },
     eliminationMode: ELIMINATION_MODE,
     onElimination: (bustedSeat, tid, seatIdx, handNum) => {
@@ -292,18 +336,14 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
         personaForIndex(personaIdx),
       );
       console.log(`[floor:${tid}] ☠ ${bustedSeat.identity.playerId.slice(0, 16)} eliminated (hand ${handNum}) → replaced by ${newIdentity.playerId.slice(0, 16)}`);
-      // Report elimination to router
-      fetch(`${ROUTER_URL}/api/elimination`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          tableId: tid,
-          eliminatedId: bustedSeat.identity.playerId,
-          replacementId: newIdentity.playerId,
-          handNumber: handNum,
-          sourceId: `floor-${BOT_INDEX}`,
-        }),
-      }).catch(() => {});
+      // Batch elimination report
+      telemetryBatch.eliminations.push({
+        tableId: tid,
+        eliminatedId: bustedSeat.identity.playerId,
+        replacementId: newIdentity.playerId,
+        handNumber: handNum,
+        sourceId: `floor-${BOT_INDEX}`,
+      });
       return {
         identity: newIdentity,
         chips: STARTING_CHIPS,
@@ -335,30 +375,21 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
       }
     },
     onCells: (cells) => {
-      // Post cells to shadow overlay store
-      fetch(`${ROUTER_URL}/api/cells`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cells, sourceId: `floor-${BOT_INDEX}/${tableId}` }),
-      }).catch(() => {});
+      telemetryBatch.cells.push({ cells, sourceId: `floor-${BOT_INDEX}/${tableId}` });
     },
     onPremiumHand: (event) => {
       console.log(`[floor:${tableId}] 🃏 PREMIUM: ${event.handRank} by ${event.playerId.slice(0, 16)} — ${event.cards}`);
-      fetch(`${ROUTER_URL}/api/premium-hand`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...event, tableId, timestamp: Date.now() }),
-      }).catch(() => {});
+      telemetryBatch.premiumHands.push({ ...event, tableId, timestamp: Date.now() });
     },
     onHandComplete: (tid, handNumber, winner, pot, actions) => {
       // Payment channel: award pot to winner (fire-and-forget)
       hubHandCompleteHandler(tid, handNumber, winner, pot, actions);
 
       runningTxs += actions.length + 3;
-      reportHand(tid, seats, winner, pot, actions, handNumber, runningTxs).catch(() => {});
+      reportHand(tid, seats, winner, pot, actions, handNumber, runningTxs);
 
       if ((handNumber + 1) % 20 === 0) {
-        reportPlayerStats(tid, seats, handNumber + 1).catch(() => {});
+        reportPlayerStats(tid, seats, handNumber + 1);
       }
 
       if ((handNumber + 1) % 100 === 0) {
@@ -438,6 +469,28 @@ async function main() {
   await initBroadcastEngine();
   await initMulticast();
 
+  // Report mesh status to border-router every 5s
+  let meshMsgIn = 0, meshMsgOut = 0;
+  const meshInterval = multicast ? setInterval(() => {
+    const stats = multicast!.getStats();
+    const deltaIn = stats.objects - meshMsgIn;
+    const deltaOut = 0; // objects is cumulative rx; tx not tracked separately
+    meshMsgIn = stats.objects;
+    fetch(`${ROUTER_URL}/api/mesh-status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nodeId: `floor-${BOT_INDEX}`,
+        role: 'floor',
+        peers: stats.peers,
+        objectsShared: stats.objects,
+        uptimeMs: stats.uptime,
+        messagesIn: deltaIn,
+        messagesOut: deltaOut,
+      }),
+    }).catch(() => {});
+  }, 5_000) : null;
+
   const results = await Promise.all(
     Array.from({ length: TABLES_PER_NODE }, (_, t) =>
       runTable(t, BOT_INDEX * TABLES_PER_NODE + t),
@@ -469,6 +522,22 @@ async function main() {
     });
   } catch {}
 
+  // Final telemetry flush before shutdown
+  clearInterval(telemetryFlushInterval);
+  const finalBatch = telemetryBatch;
+  const hasFinal = finalBatch.hands.length || finalBatch.playerStats.length || finalBatch.swarmEma.length
+    || finalBatch.cells.length || finalBatch.eliminations.length || finalBatch.premiumHands.length;
+  if (hasFinal) {
+    try {
+      await fetch(`${ROUTER_URL}/api/batch-telemetry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceId: `floor-${BOT_INDEX}`, ...finalBatch }),
+      });
+    } catch {}
+  }
+
+  if (meshInterval) clearInterval(meshInterval);
   if (multicast) await multicast.stop();
 
   // Sweep remaining UTXOs back to change address

@@ -160,6 +160,8 @@ async function initBroadcastEngine(): Promise<void> {
     feeRate: Number(process.env.FEE_RATE ?? '0.1'),
     minFee: Number(process.env.MIN_FEE ?? '25'),
     splitSatoshis: Number(process.env.SPLIT_SATS ?? '500'),
+    arcUrl: process.env.ARC_URL || undefined,
+    arcApiKey: process.env.ARC_API_KEY || undefined,
     // All containers share one key — fund once, done
     privateKeyWif: privKeyWif || undefined,
   });
@@ -169,7 +171,11 @@ async function initBroadcastEngine(): Promise<void> {
   broadcastEngine.enableAuditLog(`${logDir}/txids-apex-${APEX_INDEX}.csv`);
 
   const addr = broadcastEngine.getFundingAddress();
-  const fundingTxHex = process.env.FUNDING_TX_HEX ?? '';
+  const { readFileSync, existsSync } = await import('fs');
+  const fundingTxHex = process.env.FUNDING_TX_HEX
+    || (process.env.FUNDING_TX_HEX_FILE && existsSync(process.env.FUNDING_TX_HEX_FILE)
+      ? readFileSync(process.env.FUNDING_TX_HEX_FILE, 'utf-8').trim()
+      : '');
   const fundingVout = Number(process.env.FUNDING_VOUT ?? '0');
   const changeAddr = process.env.CHANGE_ADDRESS ?? '';
 
@@ -890,6 +896,27 @@ async function main() {
     console.log(`[${APEX_ID}] Registered with border-router (model=${LLM_MODEL})`);
   } catch {}
 
+  // Report mesh status to border-router every 5s
+  let apexMeshMsgIn = 0;
+  const meshInterval = multicast ? setInterval(() => {
+    const stats = multicast!.getStats();
+    const deltaIn = stats.objects - apexMeshMsgIn;
+    apexMeshMsgIn = stats.objects;
+    fetch(`${ROUTER_URL}/api/mesh-status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nodeId: APEX_ID,
+        role: 'apex',
+        peers: stats.peers,
+        objectsShared: stats.objects,
+        uptimeMs: stats.uptime,
+        messagesIn: deltaIn,
+        messagesOut: 0,
+      }),
+    }).catch(() => {});
+  }, 5_000) : null;
+
   console.log(`[${APEX_ID}] Waiting for floor data (${MIN_HANDS_FOR_SCORING} hands minimum)...`);
   await new Promise((r) => setTimeout(r, 5000));
 
@@ -1033,6 +1060,7 @@ async function main() {
   }
 
   shadowLoop.stop();
+  if (meshInterval) clearInterval(meshInterval);
   if (multicast) await multicast.stop();
 
   console.log(`\n[${APEX_ID}] ═══════════════════════════════════════`);

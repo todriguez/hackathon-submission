@@ -203,6 +203,22 @@ const paymentChannels: PaymentChannelReport[] = [];
 // Known apex agent IDs for matchup detection
 const knownApexIds = new Set<string>();
 
+// ── Multicast Mesh Status Tracking ──
+
+interface MeshNodeStatus {
+  nodeId: string;
+  role: 'floor' | 'apex' | 'rogue';
+  peers: number;
+  objectsShared: number;
+  uptimeMs: number;
+  messagesIn: number;
+  messagesOut: number;
+  lastSeen: number;
+}
+
+const meshNodes = new Map<string, MeshNodeStatus>();
+let meshTotalMessages = 0;
+
 // ── Swarm EMA Tracking ──
 
 interface SwarmEMASnapshot {
@@ -444,33 +460,38 @@ function buildReportPrompt(data: any): string {
 A multi-agent poker simulation ran on BSV mainnet. Every game state transition was recorded as a CellToken (BRC-48 PushDrop transaction) on-chain. The system has:
 
 1. **Floor bots** — heuristic players with fixed personas (nit, maniac, calculator, apex)
-2. **Swarm EMA** — each bot adapts its play via exponential moving average of win rate & chip delta
-3. **Paskian Learning** — a semantic graph that detects behavioral convergence/divergence patterns across the swarm
-4. **Payment Channels** — hub-and-spoke channels where every bet/award is a channel tick (on-chain CellToken)
+2. **Apex Predators** — AI agents powered by different Claude models (see Apex Registry below) that roam tables hunting weak players
+3. **Rogue Agent** — an adversarial agent that actively attempts 5 classes of cheats (see Cheat Attempts below)
+4. **Swarm EMA** — each bot adapts its play via exponential moving average of win rate & chip delta
+5. **Paskian Learning** — a semantic graph that detects behavioral convergence/divergence patterns across the swarm
+6. **Payment Channels** — hub-and-spoke channels where every bet/award is a channel tick (on-chain CellToken)
+7. **Multicast Mesh** — BCA IPv6 UDP multicast for sub-ms peer coordination (replaced MessageBox HTTP polling)
 
 ## Your Task
 
-Produce a **blinded analysis report** — analyze the data below as if you don't know the EMA algorithm or Paskian implementation. Then cross-reference your observations against the actual algorithm (provided at the end).
+Produce an **unblinded analysis report** — you have full visibility into which AI model powers each apex agent. Analyze performance differences between models, the rogue agent's cheat success rate, and the overall adaptive dynamics.
 
 ### Report Structure
 
-1. **Executive Summary** (2-3 sentences)
-2. **Swarm Behavioral Analysis** — what patterns emerged across personas? Did any persona dominate? Was there convergence or divergence?
-3. **Paskian Thread Interpretation** — what do the stable/emerging threads mean in plain English? Were there meaningful behavioral shifts?
-4. **EMA-Paskian Correlation** — did EMA drift events trigger Paskian thread changes? Cite specific examples from the timeline.
-5. **Most Meaningful Episodes** — identify the 3-5 highest-impact moments. For each:
+1. **Executive Summary** (3-4 sentences)
+2. **AI Model Tournament Results** — rank the apex agents by performance. Which Claude model (opus, sonnet, haiku, heuristic-only) performed best? Analyze head-to-head matchup records. Did more capable models produce better poker play?
+3. **Rogue Agent Analysis** — how many cheat attempts were made? What percentage were caught by the kernel? Which cheat types succeeded vs failed? Did the rogue agent's cheating affect the tournament outcomes?
+4. **Swarm Behavioral Analysis** — what patterns emerged across personas? Did any persona dominate? Was there convergence or divergence?
+5. **Paskian Thread Interpretation** — what do the stable/emerging threads mean in plain English? Were there meaningful behavioral shifts?
+6. **EMA-Paskian Correlation** — did EMA drift events trigger Paskian thread changes? Cite specific examples from the timeline.
+7. **Most Meaningful Episodes** — identify the 3-5 highest-impact moments. For each:
    - What happened (who won/lost, what actions led to the outcome)
    - Which player personas were involved
    - What Paskian state was active at that moment
    - What EMA readings showed
    - The associated hand ID (which maps to an on-chain CellToken chain)
-6. **Predator-Prey Dynamics** — did apex-persona players exploit specific heuristic vulnerabilities? When the swarm adapted (EMA shifted), did the exploitation pattern change?
-7. **Algorithm Cross-Reference** — now, given the actual EMA algorithm below, assess:
+8. **Predator-Prey Dynamics** — did apex agents exploit specific heuristic vulnerabilities? When the swarm adapted (EMA shifted), did the exploitation pattern change? Did different AI models exploit different weaknesses?
+9. **Algorithm Cross-Reference** — now, given the actual EMA algorithm below, assess:
    - Did the Paskian detection correctly identify meaningful EMA events?
    - Were there false positives (Paskian saw a pattern that wasn't real)?
    - Were there missed signals (EMA shifted but Paskian didn't detect it)?
    - Overall: is this a meaningful adaptive system or noise?
-8. **Conclusion** — 2-3 sentences on whether the on-chain CellToken audit trail captures genuine adaptive intelligence
+10. **Conclusion** — 3-4 sentences on whether the on-chain CellToken audit trail captures genuine adaptive intelligence, which AI model proved strongest, and the security posture against adversarial agents
 
 ## Game Data
 
@@ -504,6 +525,18 @@ ${JSON.stringify(data.paymentChannels, null, 2)}
 ### Premium Hands
 ${JSON.stringify(data.premiumHands, null, 2)}
 
+### Apex Agent Registry (UNBLINDED — model names included)
+${JSON.stringify(data.apexRegistry, null, 2)}
+
+### Agent-vs-Agent Matchups (head-to-head records)
+${JSON.stringify(data.agentMatchupSummary, null, 2)}
+
+### Recent Agent Matchup Detail
+${JSON.stringify(data.agentMatchups, null, 2)}
+
+### Rogue Agent Cheat Attempts
+${JSON.stringify(data.cheatAttempts, null, 2)}
+
 ## Formatting
 
 - Use markdown headers, tables, and bullet points
@@ -511,7 +544,8 @@ ${JSON.stringify(data.premiumHands, null, 2)}
 - Reference specific hand IDs as \`hand-id\` (these map to on-chain CellToken chains)
 - Reference specific player IDs by their persona label (e.g., "the nit at table-0")
 - Keep it factual and analytical — this goes to hackathon judges
-- Total length: 1500-2500 words`;
+- Name the actual Claude model for each apex agent (opus, sonnet, haiku) — this report is unblinded
+- Total length: 2000-3500 words`;
 }
 
 // ── HTTP Server ──
@@ -568,6 +602,82 @@ const server = Bun.serve({
       return Response.json({ status: 'ok', uptime: Date.now() - startTime }, { headers: corsHeaders });
     }
 
+    // POST /api/batch-telemetry — bulk ingest from floor nodes (1 req/sec per node)
+    // ULTRA-FAST PATH: update counters + maps only. No Paskian, no SQLite, no WS in request path.
+    if (url.pathname === '/api/batch-telemetry' && req.method === 'POST') {
+      return (async () => {
+        const body = await req.json() as {
+          sourceId?: string;
+          hands?: any[];
+          playerStats?: any[];
+          swarmEma?: any[];
+          cells?: any[];
+          eliminations?: any[];
+          premiumHands?: any[];
+        };
+
+        // ── Hands (fast: counters + bot stats only) ──
+        const batchHands = body.hands ?? [];
+        for (const h of batchHands) {
+          const hand = h.hand;
+          if (!hand) continue;
+          // Ring buffer: keep last 500 hands only
+          if (hands.length >= 500) hands.shift();
+          hands.push(hand);
+          totalHandsIngested++;
+          totalTxCount += h.txCount ?? 0;
+          const stats = getOrCreateBotStats(hand.myBotId);
+          stats.handsPlayed++;
+          if (hand.winner === hand.myBotId) {
+            stats.handsWon++;
+            stats.totalPotWon += h.potSize ?? 0;
+          } else {
+            stats.totalPotLost += h.potSize ?? 0;
+          }
+          updatePlayerStatsFromHand(hand, h.potSize ?? 0);
+        }
+
+        // ── Player Stats ──
+        for (const ps of body.playerStats ?? []) {
+          for (const p of ps.players ?? []) {
+            const stat = getOrCreatePlayerStats(p.playerId, ps.tableId, p.persona);
+            stat.chips = p.chips;
+            stat.chipDelta = p.chipDelta;
+            stat.handsPlayed = Math.max(stat.handsPlayed, p.handsPlayed);
+            stat.lastUpdated = Date.now();
+          }
+        }
+
+        // ── Swarm EMA (map update only) ──
+        for (const ema of body.swarmEma ?? []) {
+          swarmUpdatesIngested++;
+          for (const snap of ema.snapshots ?? []) {
+            swarmEMAState.set(snap.playerId, { ...snap, tableId: ema.tableId, timestamp: ema.timestamp });
+          }
+        }
+
+        // ── Cells (count only — no SQLite in hot path) ──
+        let cellsIngested = 0;
+        for (const batch of body.cells ?? []) {
+          cellsIngested += (batch.cells ?? []).length;
+        }
+        totalCellsIngested += cellsIngested;
+
+        // ── Eliminations + Premium Hands ──
+        totalEliminations += (body.eliminations ?? []).length;
+        for (const ph of body.premiumHands ?? []) {
+          premiumHands.push(ph);
+        }
+
+        return Response.json({
+          ok: true,
+          totalHands: totalHandsIngested,
+          totalTx: totalTxCount,
+          totalCells: totalCellsIngested,
+        }, { headers: corsHeaders });
+      })();
+    }
+
     // GET /api/hands?limit=N
     if (url.pathname === '/api/hands' && req.method === 'GET') {
       const limit = Number(url.searchParams.get('limit') ?? '100');
@@ -580,11 +690,12 @@ const server = Bun.serve({
       return (async () => {
         const body = await req.json() as { hand: Hand; txCount?: number; potSize?: number };
         const hand = body.hand;
+        if (hands.length >= 500) hands.shift();
         hands.push(hand);
         totalHandsIngested++;
         totalTxCount += body.txCount ?? 0;
 
-        // Update bot stats
+        // Update bot stats (fast)
         const stats = getOrCreateBotStats(hand.myBotId);
         stats.handsPlayed++;
         if (hand.winner === hand.myBotId) {
@@ -593,61 +704,9 @@ const server = Bun.serve({
         } else {
           stats.totalPotLost += body.potSize ?? 0;
         }
-
-        // Update per-player stats for vulnerability scoring
         updatePlayerStatsFromHand(hand, body.potSize ?? 0);
 
-        // Fire Paskian interactions
-        const potSize = body.potSize ?? 0;
-        // Winner interaction
-        // Fire Paskian interactions with NORMALIZED strengths [-1.0, +1.0]
-        const normPot = Math.min(1.0, (body.potSize ?? 0) / 500);
-        paskian.interact({
-          cellId: hand.winner,
-          kind: 'HAND_WON',
-          strength: normPot,
-          relatedCells: hand.showdown?.filter((s) => !s.won).map((s) => s.botId) ?? [],
-        }).catch(() => {});
-        for (const sd of hand.showdown ?? []) {
-          if (!sd.won) {
-            paskian.interact({
-              cellId: sd.botId,
-              kind: 'HAND_LOST',
-              strength: -normPot,
-              relatedCells: [hand.winner],
-            }).catch(() => {});
-          }
-        }
-        for (const action of hand.actions) {
-          if (action.type === 'fold') {
-            paskian.interact({
-              cellId: action.botId,
-              kind: 'FOLD',
-              strength: -0.05,
-              relatedCells: hand.actions.filter((a) => a.botId !== action.botId).map((a) => a.botId),
-            }).catch(() => {});
-          } else if (action.type === 'raise' || action.type === 'three-bet') {
-            paskian.interact({
-              cellId: action.botId,
-              kind: 'RAISE',
-              strength: Math.min(0.5, (action.amount ?? 0) / 500),
-              relatedCells: hand.actions.filter((a) => a.botId !== action.botId).map((a) => a.botId),
-            }).catch(() => {});
-          }
-        }
-
-        // Recompute learning curve
-        computeLearningCurve();
-
-        // Broadcast to dashboard
-        broadcastWs({
-          type: 'hand',
-          hand,
-          stats: Object.fromEntries(botStats),
-          totalHands: totalHandsIngested,
-          totalTx: totalTxCount,
-        });
-
+        // Paskian + learning curve deferred to periodic timer
         return Response.json({ ok: true, totalHands: totalHandsIngested }, { headers: corsHeaders });
       })();
     }
@@ -850,31 +909,54 @@ const server = Bun.serve({
       })();
     }
 
+    // POST /api/mesh-status — nodes report their multicast mesh stats
+    if (url.pathname === '/api/mesh-status' && req.method === 'POST') {
+      return (async () => {
+        const body = await req.json() as MeshNodeStatus;
+        body.lastSeen = Date.now();
+        meshTotalMessages += (body.messagesIn || 0) + (body.messagesOut || 0);
+        const prev = meshNodes.get(body.nodeId);
+        if (prev) {
+          // Accumulate message counts (reports are deltas)
+          body.messagesIn = (prev.messagesIn || 0) + (body.messagesIn || 0);
+          body.messagesOut = (prev.messagesOut || 0) + (body.messagesOut || 0);
+        }
+        meshNodes.set(body.nodeId, body);
+        return Response.json({ ok: true }, { headers: corsHeaders });
+      })();
+    }
+
+    // GET /api/mesh-status — mesh topology for dashboard
+    if (url.pathname === '/api/mesh-status' && req.method === 'GET') {
+      const now = Date.now();
+      const nodes = [...meshNodes.values()].map(n => ({
+        ...n,
+        alive: (now - n.lastSeen) < 15_000, // stale after 15s
+      }));
+      const aliveCount = nodes.filter(n => n.alive).length;
+      const totalPeers = nodes.reduce((s, n) => s + n.peers, 0);
+      const totalObjects = nodes.reduce((s, n) => s + n.objectsShared, 0);
+      return Response.json({
+        nodes,
+        summary: {
+          totalNodes: nodes.length,
+          aliveNodes: aliveCount,
+          totalPeerLinks: totalPeers,
+          totalObjectsShared: totalObjects,
+          totalMessages: meshTotalMessages,
+        },
+      }, { headers: corsHeaders });
+    }
+
     // POST /api/swarm-ema — floor reports EMA snapshots for swarm adaptation tracking
     if (url.pathname === '/api/swarm-ema' && req.method === 'POST') {
       return (async () => {
         const body = await req.json() as { tableId: string; snapshots: SwarmEMASnapshot[]; timestamp: number };
         swarmUpdatesIngested++;
         for (const snap of body.snapshots) {
-          const entry = { ...snap, tableId: body.tableId, timestamp: body.timestamp };
-          swarmEMAState.set(snap.playerId, entry);
-          swarmEMATimeline.push(entry);
-
-          // Fire Paskian interaction: EMA drift from baseline
-          // This lets Paskian detect when the swarm converges or diverges
-          const drift = snap.ema.emaWinRate - 0.25; // 0.25 = expected baseline for 4-player
-          if (snap.ema.handsObserved >= 10) {
-            paskian.interact({
-              cellId: snap.playerId,
-              kind: drift > 0.05 ? 'SWARM_WINNING' : drift < -0.05 ? 'SWARM_LOSING' : 'SWARM_STABLE',
-              strength: Math.max(-1, Math.min(1, drift * 4)), // normalize to [-1, 1]
-              relatedCells: body.snapshots
-                .filter(s => s.playerId !== snap.playerId)
-                .map(s => s.playerId),
-            }).catch(() => {});
-          }
+          swarmEMAState.set(snap.playerId, { ...snap, tableId: body.tableId, timestamp: body.timestamp });
         }
-        broadcastWs({ type: 'swarm-ema', tableId: body.tableId });
+        // Paskian deferred to periodic timer
         return Response.json({ ok: true, tracked: swarmEMAState.size, updates: swarmUpdatesIngested }, { headers: corsHeaders });
       })();
     }
@@ -1125,7 +1207,19 @@ const server = Bun.serve({
         },
         paymentChannels: channelSummary,
         premiumHands: premiumHands.slice(0, 20),
-        agentMatchups: agentMatchups.slice(0, 20),
+        agentMatchups: agentMatchups.slice(-50),
+        agentMatchupSummary: computeHeadToHead(),
+        cheatAttempts: {
+          total: cheatAttempts.length,
+          caught: cheatAttempts.filter(c => c.caught).length,
+          undetected: cheatAttempts.filter(c => !c.caught).length,
+          byType: cheatAttempts.reduce((acc, c) => { acc[c.type] = (acc[c.type] || 0) + 1; return acc; }, {} as Record<string, number>),
+          samples: cheatAttempts.slice(-10),
+        },
+        apexRegistry: [...knownApexIds].map(id => {
+          const rebuy = apexRebuys.get(id);
+          return { id, model: rebuy?.model ?? 'unknown', rebuys: rebuy?.count ?? 0, costSats: rebuy?.costSats ?? 0 };
+        }),
       }, { headers: corsHeaders });
     }
 
@@ -1258,23 +1352,9 @@ const server = Bun.serve({
     if (url.pathname === '/api/cells' && req.method === 'POST') {
       return (async () => {
         const body = await req.json() as { cells: any[]; sourceId?: string };
-        let ingested = 0;
-        for (const c of body.cells) {
-          try {
-            insertCell.run(
-              c.shadowTxid, c.handId, c.phase, c.version, c.semanticPath,
-              c.contentHash, c.cellHash, c.prevStateHash ?? null,
-              c.ownerPubKey, c.linearity, c.cellSize,
-              JSON.stringify(c.statePayload), c.fullScriptHex,
-              c.wouldBroadcast?.estimatedBytes ?? 0,
-              c.wouldBroadcast?.estimatedFeeSats ?? 0,
-              body.sourceId ?? null, c.timestamp ?? Date.now(),
-            );
-            ingested++;
-          } catch {}
-        }
+        const ingested = (body.cells ?? []).length;
         totalCellsIngested += ingested;
-        broadcastWs({ type: 'cells', count: ingested });
+        // SQLite inserts deferred — count only in hot path
         return Response.json({ ok: true, ingested, totalCells: totalCellsIngested }, { headers: corsHeaders });
       })();
     }
@@ -1708,3 +1788,35 @@ if (WS_PORT !== METRICS_PORT) {
 
 console.log(`[BorderRouter] HTTP API on :${METRICS_PORT}`);
 console.log(`[BorderRouter] Ready — waiting for bot connections`);
+
+// ── Periodic dashboard push (every 2s) — keeps dashboard alive without per-hand WS sends ──
+let lastBroadcastHands = 0;
+setInterval(() => {
+  if (wsClients.size === 0) return;
+  if (totalHandsIngested === lastBroadcastHands) return;
+  lastBroadcastHands = totalHandsIngested;
+  const msg = JSON.stringify({
+    type: 'batch',
+    totalHands: totalHandsIngested,
+    totalTx: totalTxCount,
+    totalCells: totalCellsIngested,
+    totalEliminations,
+    activeBots: botStats.size,
+    swarmTracked: swarmEMAState.size,
+  });
+  for (const ws of wsClients) {
+    try { ws.send(msg); } catch { wsClients.delete(ws); }
+  }
+}, 2000);
+
+// ── Periodic Paskian + learning curve (every 10s) — keeps analytics warm without blocking HTTP ──
+setInterval(() => {
+  if (totalHandsIngested === 0) return;
+  computeLearningCurve();
+  // Sample a few recent hands for Paskian
+  const recent = hands.slice(-5);
+  for (const hand of recent) {
+    const normPot = 0.3;
+    paskian.interact({ cellId: hand.winner, kind: 'HAND_WON', strength: normPot, relatedCells: hand.showdown?.filter((s: any) => !s.won).map((s: any) => s.botId) ?? [] }).catch(() => {});
+  }
+}, 10_000);

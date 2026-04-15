@@ -32,6 +32,7 @@ x-floor-base: &floor-base
   restart: ${FLOOR_RESTART:-always}
   volumes:
     - audit-logs:/audit:rw
+    - ./data:/funding:ro
   depends_on:
     router:
       condition: service_started
@@ -48,12 +49,15 @@ x-floor-env: &floor-env
   SMALL_BLIND: "5"
   BIG_BLIND: "10"
   FEE_RATE: ${FEE_RATE:-0.1}
-  MIN_FEE: ${MIN_FEE:-135}
+  MIN_FEE: ${MIN_FEE:-136}
   SPLIT_SATS: ${SPLIT_SATS:-2000}
+  ARC_URL: ${ARC_URL:-https://arc.gorillapool.io}
+  ARC_API_KEY: ${ARC_API_KEY:-}
   ELIMINATION_MODE: ${ELIMINATION_MODE:-true}
   PRIVATE_KEY_WIF: ${PRIVATE_KEY_WIF:-}
   CHANGE_ADDRESS: ${CHANGE_ADDRESS:-}
   FUNDING_TX_HEX: ${FUNDING_TX_HEX:-}
+  FUNDING_TX_HEX_FILE: ${FUNDING_TX_HEX_FILE:-}
   AUDIT_LOG_DIR: /audit
 
 # ── Shared base for apex predators ──
@@ -69,6 +73,7 @@ x-apex-base: &apex-base
   restart: "no"
   volumes:
     - audit-logs:/audit:rw
+    - ./data:/funding:ro
   depends_on:
     router:
       condition: service_started
@@ -88,12 +93,15 @@ x-apex-env: &apex-env
   WALLET_FUNDING_SATS: ${WALLET_FUNDING_SATS:-100000}
   MSGBOX_HOST: ${MSGBOX_HOST:-https://messagebox.babbage.systems}
   FEE_RATE: ${FEE_RATE:-0.1}
-  MIN_FEE: ${MIN_FEE:-135}
+  MIN_FEE: ${MIN_FEE:-136}
   SPLIT_SATS: ${SPLIT_SATS:-2000}
+  ARC_URL: ${ARC_URL:-https://arc.gorillapool.io}
+  ARC_API_KEY: ${ARC_API_KEY:-}
   REBUY_COST_SATS: ${REBUY_COST_SATS:-10}
   PRIVATE_KEY_WIF: ${PRIVATE_KEY_WIF:-}
   CHANGE_ADDRESS: ${CHANGE_ADDRESS:-}
   FUNDING_TX_HEX: ${FUNDING_TX_HEX:-}
+  FUNDING_TX_HEX_FILE: ${FUNDING_TX_HEX_FILE:-}
   AUDIT_LOG_DIR: /audit
 
 services:
@@ -265,8 +273,11 @@ services:
       - "9090:9090"
     networks:
       - casino-mesh
+    volumes:
+      - audit-logs:/audit:ro
     environment:
       METRICS_PORT: "9090"
+      AUDIT_LOG_DIR: /audit
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://localhost:9090/health').then(r => process.exit(r.ok ? 0 : 1))"]
       interval: 10s

@@ -381,7 +381,18 @@ export class DirectBroadcastEngine {
     this.log('SPLIT', `WoC broadcast: ${wocOk ? 'OK' : 'FAILED'}`);
 
     if (!arcOk && !wocOk) {
-      throw new Error(`Split broadcast failed on both ARC and WoC. txid=${txid}`);
+      // Last resort: check if tx is already on-chain (from a previous run)
+      try {
+        const checkResp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}`);
+        if (checkResp.ok) {
+          this.log('SPLIT', `Tx ${txid.slice(0, 16)}... already on-chain — proceeding`);
+        } else {
+          throw new Error(`Split broadcast failed on both ARC and WoC. txid=${txid}`);
+        }
+      } catch (checkErr: any) {
+        if (checkErr.message.includes('Split broadcast failed')) throw checkErr;
+        throw new Error(`Split broadcast failed on both ARC and WoC. txid=${txid}`);
+      }
     }
 
     // Verify tx is visible (wait up to 10s)
@@ -416,6 +427,85 @@ export class DirectBroadcastEngine {
     this.log('SPLIT', `Partitioned: ${this.utxoPools.map((p, i) => `stream${i}=${p.length}`).join(', ')}`);
 
     return { txid, splits };
+  }
+
+  /**
+   * Discover existing UTXOs from WoC and distribute them directly to stream pools.
+   * Use this when the address already has many small UTXOs (e.g. from a previous run).
+   * Skips pre-split entirely — just fetches and partitions what's already on-chain.
+   */
+  async discoverUtxos(partitionIndex?: number, totalPartitions?: number): Promise<{ count: number; totalSats: number }> {
+    const address = this.getFundingAddress();
+    this.log('DISCOVER', `Fetching UTXOs for ${address}...`);
+
+    const resp = await fetch(
+      `https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`,
+    );
+    if (!resp.ok) throw new Error(`WoC returned ${resp.status}`);
+
+    const utxos: any[] = await resp.json();
+    if (utxos.length === 0) throw new Error('No UTXOs found on-chain');
+
+    // Filter out dust that can't cover a CellToken fee
+    const MIN_USEFUL = this.config.minFee + 2;
+    let usable = utxos.filter(u => u.value >= MIN_USEFUL);
+
+    // If partitioned, take only our slice (deterministic split by index)
+    if (partitionIndex !== undefined && totalPartitions !== undefined && totalPartitions > 1) {
+      usable = usable.filter((_, i) => i % totalPartitions === partitionIndex);
+      this.log('DISCOVER', `Partition ${partitionIndex}/${totalPartitions}: taking ${usable.length} of ${utxos.length} UTXOs`);
+    }
+    const totalSats = usable.reduce((s, u) => s + u.value, 0);
+
+    this.log('DISCOVER', `Found ${usable.length} usable UTXOs (${totalSats.toLocaleString()} sats), discarded ${utxos.length - usable.length} dust`);
+
+    // Fetch unique source txs (many UTXOs share the same parent tx)
+    const uniqueTxids = [...new Set(usable.map(u => u.tx_hash))];
+    this.log('DISCOVER', `Need ${uniqueTxids.length} unique source txs for ${usable.length} UTXOs`);
+
+    const txCache = new Map<string, Transaction>();
+    const BATCH = 3;
+    for (let i = 0; i < uniqueTxids.length; i += BATCH) {
+      const chunk = uniqueTxids.slice(i, i + BATCH);
+      const results = await Promise.allSettled(
+        chunk.map(async (txid) => {
+          const txResp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`);
+          if (!txResp.ok) throw new Error(`WoC ${txResp.status} for ${txid}`);
+          const hex = await txResp.text();
+          return { txid, tx: Transaction.fromHex(hex) };
+        }),
+      );
+      for (const r of results) {
+        if (r.status === 'fulfilled') txCache.set(r.value.txid, r.value.tx);
+      }
+      if (i + BATCH < uniqueTxids.length) {
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+    this.log('DISCOVER', `Fetched ${txCache.size}/${uniqueTxids.length} source txs`);
+
+    // Build funding UTXOs from cache
+    const fundingUtxos: FundingUtxo[] = [];
+    for (const u of usable) {
+      const sourceTx = txCache.get(u.tx_hash);
+      if (sourceTx) {
+        fundingUtxos.push({
+          txid: u.tx_hash as string,
+          vout: u.tx_pos as number,
+          satoshis: u.value as number,
+          sourceTx,
+        });
+      }
+    }
+
+    // Partition across streams
+    this.utxoPools = Array.from({ length: this.config.streams }, () => []);
+    for (let i = 0; i < fundingUtxos.length; i++) {
+      this.utxoPools[i % this.config.streams].push(fundingUtxos[i]);
+    }
+
+    this.log('DISCOVER', `Partitioned ${fundingUtxos.length} UTXOs: ${this.utxoPools.map((p, i) => `stream${i}=${p.length}`).join(', ')}`);
+    return { count: fundingUtxos.length, totalSats };
   }
 
   /**
@@ -981,16 +1071,18 @@ export class DirectBroadcastEngine {
         if (batchNum <= 2 || fail > 0) {
           this.log('BATCH', `Batch #${batchNum}: ${ok} ok, ${fail} failed in ${elapsed}ms — sample: ${JSON.stringify(results[0]).slice(0, 200)}`);
         }
+
+        // Dual-broadcast: push to WoC for reliable propagation (rate-limited to avoid 429)
+        // Send 1 per batch to verify propagation without hammering WoC
+        if (batch.length > 0) {
+          this.wocBroadcast(batch[0].toHex()).catch(() => {});
+        }
       } catch (err: any) {
         this.errors.push(`Batch broadcast error: ${err.message}`);
-        this.log('BATCH', `Batch #${batchNum} error: ${err.message} — falling back to individual ARC`);
-        // Fallback: try each tx individually via SDK (uses single /v1/tx endpoint)
-        for (const tx of batch) {
-          try {
-            await tx.broadcast(this.arc);
-          } catch (e: any) {
-            this.errors.push(`Individual ARC fallback failed: ${e.message}`);
-          }
+        this.log('BATCH', `Batch #${batchNum} error: ${err.message} — falling back to WoC`);
+        // Fallback: broadcast first tx via WoC as probe
+        if (batch.length > 0) {
+          this.wocBroadcast(batch[0].toHex()).catch(() => {});
         }
       }
     })();
@@ -1032,6 +1124,11 @@ export class DirectBroadcastEngine {
       });
       if (!resp.ok) {
         const body = await resp.text();
+        // "txn-already-known" or "already in the mempool" means the tx IS on the network
+        if (body.includes('already-known') || body.includes('already in the mempool')) {
+          this.log('WOC', `Tx already on network (treating as success)`);
+          return true;
+        }
         this.log('WOC', `Backup broadcast returned ${resp.status}: ${body.slice(0, 200)}`);
         return false;
       }

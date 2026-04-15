@@ -69,6 +69,13 @@
     </div>
   </div>
 
+  <!-- Multicast Mesh -->
+  <div class="card">
+    <h2>Multicast Mesh</h2>
+    <p style="font-size:0.7em; color:#555; margin-bottom:8px;">BCA IPv6 UDP multicast — sub-ms peer coordination replacing MessageBox (7.7s → &lt;1ms)</p>
+    <div id="mesh-status"><div class="empty">No mesh nodes reporting...</div></div>
+  </div>
+
   <!-- CellToken Overlay Stats -->
   <div class="card">
     <h2>CellToken Overlay</h2>
@@ -436,6 +443,39 @@ async function refreshApex() {
   ).join('');
 }
 
+async function refreshMesh() {
+  const d = await fetchJSON('/api/mesh-status');
+  if (!d || !d.nodes?.length) return;
+  const el = document.getElementById('mesh-status');
+  const s = d.summary;
+
+  let html = '';
+  // Summary bar
+  html += `<div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:10px;">`;
+  html += `<div class="stat" style="flex:1; min-width:100px;"><span class="label">Nodes</span><span class="value">${s.aliveNodes}/${s.totalNodes}</span></div>`;
+  html += `<div class="stat" style="flex:1; min-width:100px;"><span class="label">Peer Links</span><span class="value green">${s.totalPeerLinks}</span></div>`;
+  html += `<div class="stat" style="flex:1; min-width:100px;"><span class="label">Objects Shared</span><span class="value">${fmt(s.totalObjectsShared)}</span></div>`;
+  html += `<div class="stat" style="flex:1; min-width:100px;"><span class="label">Messages</span><span class="value purple">${fmt(s.totalMessages)}</span></div>`;
+  html += `</div>`;
+
+  // Node topology — compact visual grid
+  html += `<div style="display:flex; gap:6px; flex-wrap:wrap;">`;
+  for (const n of d.nodes) {
+    const alive = n.alive;
+    const borderColor = n.role === 'apex' ? '#b388ff' : n.role === 'rogue' ? '#ff4444' : '#00d4ff';
+    const bg = alive ? '#12121f' : '#0a0a0f';
+    const opacity = alive ? '1' : '0.4';
+    html += `<div style="background:${bg}; border:1px solid ${borderColor}; border-radius:4px; padding:6px 10px; font-size:0.75em; opacity:${opacity}; min-width:120px;">`;
+    html += `<div style="color:${borderColor}; font-weight:bold;">${n.nodeId}</div>`;
+    html += `<div style="color:#888; font-size:0.9em;">${n.peers} peers · ${fmt(n.objectsShared)} obj</div>`;
+    html += `<div style="color:#555; font-size:0.85em;">${alive ? '● live' : '○ stale'} · ${fmtTime(n.uptimeMs)}</div>`;
+    html += `</div>`;
+  }
+  html += `</div>`;
+
+  el.innerHTML = html;
+}
+
 async function refreshSwarmEMA() {
   const d = await fetchJSON('/api/swarm-ema');
   if (!d || !d.totalPlayers) return;
@@ -697,6 +737,7 @@ async function refresh() {
   await Promise.all([
     refreshStats(),
     refreshCellStats(),
+    refreshMesh(),
     refreshCheats(),
     refreshPremium(),
     refreshMatchups(),
