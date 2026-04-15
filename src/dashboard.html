@@ -121,8 +121,8 @@
 
   <!-- Live Tx DAG -->
   <div class="card">
-    <h2>Transaction DAG (Latest)</h2>
-    <div id="tx-dag"><div class="empty">No CellToken chains yet...</div></div>
+    <h2>Transaction DAG (Latest 8)</h2>
+    <div id="tx-dag" style="max-height:320px; overflow-y:auto;"><div class="empty">No CellToken chains yet...</div></div>
   </div>
 
   <!-- Swarm EMA Adaptation -->
@@ -337,16 +337,16 @@ async function refreshSettlements() {
 }
 
 async function refreshTxDag() {
-  const d = await fetchJSON('/api/tx-dag?limit=5');
+  const d = await fetchJSON('/api/tx-dag?limit=8');
   if (!d?.chains?.length) return;
   const el = document.getElementById('tx-dag');
-  el.innerHTML = d.chains.map(chain =>
-    `<div style="margin-bottom:8px; padding:4px; background:#0e0e1a; border-radius:4px">` +
-    `<div style="font-size:0.75em; color:#7b7baa">${chain.handId?.slice(0,20) || 'chain'} (${chain.cells?.length || 0} cells)</div>` +
-    `<div style="font-size:0.7em; margin-top:4px">` +
+  el.innerHTML = d.chains.slice(0, 8).map(chain =>
+    `<div style="margin-bottom:6px; padding:4px; background:#0e0e1a; border-radius:4px">` +
+    `<div style="font-size:0.7em; color:#7b7baa">${chain.handId || 'chain'} (${chain.cells?.length || 0} cells)</div>` +
+    `<div style="font-size:0.65em; margin-top:2px">` +
     (chain.cells || []).map(c =>
-      `<span class="badge linear">${c.phase}</span> `
-    ).join('→ ') +
+      `<span class="badge linear">${c.phase}</span>`
+    ).join(' → ') +
     `</div></div>`
   ).join('');
 }

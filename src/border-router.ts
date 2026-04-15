@@ -1180,10 +1180,11 @@ const server = Bun.serve({
       const totalFee = overlayDb.prepare('SELECT SUM(estimated_fee_sats) as total FROM cells').get() as any;
       const totalBytes = overlayDb.prepare('SELECT SUM(estimated_bytes) as total FROM cells').get() as any;
 
-      // Build chains grouped by hand_id for dashboard consumption
+      // Build chains grouped by hand_id for dashboard consumption (latest N only)
+      const chainLimit = Number(url.searchParams.get('limit') ?? '10');
       const handRows = overlayDb.prepare(
-        'SELECT DISTINCT hand_id FROM cells ORDER BY hand_id',
-      ).all() as any[];
+        'SELECT hand_id, MAX(timestamp) as last_ts FROM cells GROUP BY hand_id ORDER BY last_ts DESC LIMIT ?',
+      ).all(chainLimit) as any[];
       const chains = handRows.map((row: any) => {
         const cells = overlayDb.prepare(
           'SELECT phase, shadow_txid, version, semantic_path, estimated_bytes, estimated_fee_sats, timestamp FROM cells WHERE hand_id = ? ORDER BY version ASC',
