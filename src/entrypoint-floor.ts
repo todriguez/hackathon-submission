@@ -36,6 +36,7 @@ import {
 } from './protocol/adapters/docker-multicast-adapter';
 import { RealUdpTransport } from './protocol/adapters/udp-transport';
 import { DirectBroadcastEngine } from './agent/direct-broadcast-engine';
+import { TablePaymentHub } from './engine/table-payment-hub';
 
 // ── Config ──
 
@@ -228,6 +229,35 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
     console.log(`[floor:${tableId}] ELIMINATION MODE — busted bots are replaced with fresh players`);
   }
 
+  // ── Payment Channel Hub (hub-and-spoke: table ↔ each player) ──
+  const tableIdentity = deriveIdentityFromSeed(
+    `table-hub-${BOT_INDEX}-${globalTableIdx}`,
+    personaForIndex(0), // table identity uses first persona (arbitrary)
+  );
+
+  const paymentHub = new TablePaymentHub({
+    tableId,
+    tableKey: tableIdentity.privateKey,
+    tablePubKey: tableIdentity.publicKey,
+    engine: broadcastEngine ?? ({} as any), // stub engine if no broadcast
+    streamId: localTableIdx % (broadcastEngine ? TABLES_PER_NODE : 1),
+    fundingSatsPerChannel: 5000,
+    verbose: false,
+  });
+
+  // Open a channel for each seat
+  await paymentHub.openChannels(seats.map((s, i) => ({
+    seatIndex: i,
+    playerId: s.identity.playerId,
+    playerName: s.identity.persona.name,
+    pubKey: s.identity.publicKey,
+    privKey: s.identity.privateKey,
+  })));
+  console.log(`[floor:${tableId}] Payment hub opened: ${paymentHub.channelCount} channels (hub-and-spoke)`);
+
+  const hubActionHandler = paymentHub.createActionHandler();
+  const hubHandCompleteHandler = paymentHub.createHandCompleteHandler();
+
   let runningTxs = 0;
   let replacementCounter = 0;
 
@@ -284,6 +314,9 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
       };
     },
     onAction: (action, tid, handNumber) => {
+      // Payment channel: record bet ticks (fire-and-forget)
+      hubActionHandler(action, tid, handNumber);
+
       if (multicast) {
         const cellBytes = new TextEncoder().encode(JSON.stringify({
           playerId: action.playerId,
@@ -318,6 +351,9 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
       }).catch(() => {});
     },
     onHandComplete: (tid, handNumber, winner, pot, actions) => {
+      // Payment channel: award pot to winner (fire-and-forget)
+      hubHandCompleteHandler(tid, handNumber, winner, pot, actions);
+
       runningTxs += actions.length + 3;
       reportHand(tid, seats, winner, pot, actions, handNumber, runningTxs).catch(() => {});
 
@@ -335,6 +371,28 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
   };
 
   const result = await runTableEngine(config, seats, registry);
+
+  // Settle all payment channels
+  const settleResults = await paymentHub.settleAll();
+  const hubStats = paymentHub.getStats();
+  console.log(
+    `[floor:${tableId}] Payment hub settled: ${hubStats.totalChannelsSettled} channels, ` +
+    `${hubStats.totalTicks} ticks, ${hubStats.totalSatsTransferred} sats transferred, ` +
+    `${hubStats.totalPotsAwarded} pots awarded (${hubStats.totalSatsAwarded} sats)`,
+  );
+
+  // Report hub channel summary to router
+  fetch(`${ROUTER_URL}/api/payment-channels`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      tableId,
+      summary: paymentHub.getChannelSummary(),
+      stats: hubStats,
+      tickProofCount: paymentHub.getAllTickProofs().length,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
 
   const cellTokenCount = result.cellAuditLog.filter((e) => e.wouldBroadcast.type === 'CellToken').length;
   const totalEstBytes = result.cellAuditLog.reduce((s, e) => s + e.wouldBroadcast.estimatedBytes, 0);
