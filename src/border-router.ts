@@ -26,7 +26,7 @@ import Anthropic from '@anthropic-ai/sdk';
 // ── Paskian Learning Layer ──
 
 const paskian = new PaskianAdapter({
-  dbPath: ':memory:',
+  dbPath: process.env.PASKIAN_DB ?? 'data/paskian.sqlite',
   config: {
     learningRate: 0.05,        // was 0.1 — slower convergence, less overshoot
     propagationDepth: 2,       // was 3 — reduces exponential amplification
@@ -43,7 +43,11 @@ console.log(`[BorderRouter] Paskian learning layer initialized (in-memory)`);
 
 import { Database } from 'bun:sqlite';
 
-const overlayDb = new Database(':memory:');
+const OVERLAY_DB_PATH = process.env.OVERLAY_DB ?? 'data/overlay.sqlite';
+// Ensure data dir exists
+import { mkdirSync } from 'fs';
+try { mkdirSync('data', { recursive: true }); } catch {}
+const overlayDb = new Database(OVERLAY_DB_PATH);
 overlayDb.run(`
   CREATE TABLE IF NOT EXISTS cells (
     shadow_txid TEXT PRIMARY KEY,
