@@ -171,6 +171,30 @@ interface AgentMatchup {
 
 const agentMatchups: AgentMatchup[] = [];
 
+// ── Payment Channel Tracking ──
+
+interface PaymentChannelReport {
+  tableId: string;
+  channels: Array<{
+    channelId: string;
+    playerId: string;
+    state: string;
+    totalBets: number;
+    totalAwards: number;
+    netFlow: number;
+    ticks: number;
+  }>;
+  stats: {
+    totalBets: number;
+    totalAwards: number;
+    totalTicks: number;
+    channelCount: number;
+  };
+  timestamp: number;
+}
+
+const paymentChannels: PaymentChannelReport[] = [];
+
 // Known apex agent IDs for matchup detection
 const knownApexIds = new Set<string>();
 
@@ -900,6 +924,60 @@ const server = Bun.serve({
     // GET /api/settlements — settlement history
     if (url.pathname === '/api/settlements' && req.method === 'GET') {
       return Response.json(settlements, { headers: corsHeaders });
+    }
+
+    // POST /api/payment-channels — ingest payment channel summary from floor
+    if (url.pathname === '/api/payment-channels' && req.method === 'POST') {
+      return (async () => {
+        const body = await req.json() as PaymentChannelReport;
+        paymentChannels.push(body);
+        broadcastWs({ type: 'payment-channels', tableId: body.tableId, stats: body.stats });
+        console.log(
+          `[BorderRouter] Payment channels: ${body.tableId} — ${body.stats.channelCount} channels, ${body.stats.totalTicks} ticks, net ${body.stats.totalBets - body.stats.totalAwards} sats`,
+        );
+        return Response.json({ ok: true, totalReports: paymentChannels.length }, { headers: corsHeaders });
+      })();
+    }
+
+    // GET /api/payment-channels — stored channel data
+    if (url.pathname === '/api/payment-channels' && req.method === 'GET') {
+      return Response.json(paymentChannels, { headers: corsHeaders });
+    }
+
+    // GET /api/payment-channels/summary — aggregated stats across all tables
+    if (url.pathname === '/api/payment-channels/summary' && req.method === 'GET') {
+      let totalBets = 0;
+      let totalAwards = 0;
+      let totalTicks = 0;
+      let totalChannelCount = 0;
+      const byTable = new Map<string, { channelCount: number; totalBets: number; totalAwards: number; netFlow: number; totalTicks: number; lastReport: number }>();
+      for (const report of paymentChannels) {
+        totalBets += report.stats.totalBets;
+        totalAwards += report.stats.totalAwards;
+        totalTicks += report.stats.totalTicks;
+        totalChannelCount += report.stats.channelCount;
+        // Keep latest report per table
+        const existing = byTable.get(report.tableId);
+        if (!existing || report.timestamp > existing.lastReport) {
+          byTable.set(report.tableId, {
+            channelCount: report.stats.channelCount,
+            totalBets: report.stats.totalBets,
+            totalAwards: report.stats.totalAwards,
+            netFlow: report.stats.totalBets - report.stats.totalAwards,
+            totalTicks: report.stats.totalTicks,
+            lastReport: report.timestamp,
+          });
+        }
+      }
+      return Response.json({
+        totalReports: paymentChannels.length,
+        totalBets,
+        totalAwards,
+        totalTicks,
+        totalChannelCount,
+        netFlow: totalBets - totalAwards,
+        tables: Object.fromEntries(byTable),
+      }, { headers: corsHeaders });
     }
 
     // ══════════════════════════════════════════

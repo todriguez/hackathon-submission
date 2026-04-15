@@ -143,6 +143,33 @@
     </div>
   </div>
 
+  <!-- Payment Channels — Hub & Spoke -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Payment Channels &mdash; Hub &amp; Spoke</h2>
+    <p style="font-size:0.75em; color:#666; margin-bottom:8px;">Each table acts as a payment hub with spoke channels to each player. Bets flow in, awards flow out. Ticks = state updates settled through the channel.</p>
+    <div id="pay-channels"><div class="empty">No payment channel data yet...</div></div>
+  </div>
+
+  <!-- EMA → Paskian Responsiveness -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>EMA &rarr; Paskian Responsiveness</h2>
+    <p style="font-size:0.75em; color:#666; margin-bottom:8px;">Shows how swarm EMA drift triggers Paskian pattern detection. EMA events on top, Paskian threads below, linked by the nodes they share.</p>
+    <div id="ema-paskian"><div class="empty">Waiting for EMA and Paskian data...</div></div>
+  </div>
+
+  <!-- TPS Gauge -->
+  <div class="card">
+    <h2>TPS Gauge</h2>
+    <div id="tps-gauge">
+      <div class="stat"><span class="label">Current TPS</span><span class="value" id="tps-current">--</span></div>
+      <div class="stat"><span class="label">Peak TPS</span><span class="value gold" id="tps-peak">--</span></div>
+      <div style="margin-top:10px;">
+        <div style="font-size:0.75em; color:#7b7baa; margin-bottom:4px;">TPS History (last 30 samples)</div>
+        <div id="tps-chart" style="display:flex; align-items:flex-end; height:60px; gap:2px;"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Active Tables -->
   <div class="card">
     <h2>Active Tables</h2>
@@ -437,6 +464,174 @@ async function refreshExportStats() {
     ).join('');
 }
 
+// ── Payment Channels ──
+async function refreshPaymentChannels() {
+  const d = await fetchJSON('/api/payment-channels/summary');
+  if (!d || !d.totalReports) return;
+  const el = document.getElementById('pay-channels');
+
+  let html = '';
+  // Summary stats
+  html += `<div style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:12px;">`;
+  html += `<div class="stat" style="flex:1; min-width:120px;"><span class="label">Total Channels</span><span class="value">${fmt(d.totalChannelCount)}</span></div>`;
+  html += `<div class="stat" style="flex:1; min-width:120px;"><span class="label">Total Ticks</span><span class="value">${fmt(d.totalTicks)}</span></div>`;
+  html += `<div class="stat" style="flex:1; min-width:120px;"><span class="label">Sats Through</span><span class="value green">${fmtSats(d.totalBets + d.totalAwards)}</span></div>`;
+  html += `<div class="stat" style="flex:1; min-width:120px;"><span class="label">Net Flow</span><span class="value ${d.netFlow >= 0 ? 'green' : 'red'}">${d.netFlow >= 0 ? '+' : ''}${fmtSats(d.netFlow)}</span></div>`;
+  html += `</div>`;
+
+  // Per-table breakdown
+  const tables = Object.entries(d.tables || {});
+  if (tables.length > 0) {
+    html += `<table><tr><th>Table</th><th># Channels</th><th>Total Bets</th><th>Total Awards</th><th>Net Flow</th><th>Ticks</th></tr>`;
+    for (const [tableId, t] of tables) {
+      html += `<tr><td>${tableId.slice(0,14)}</td><td>${t.channelCount}</td>`;
+      html += `<td>${fmtSats(t.totalBets)}</td><td>${fmtSats(t.totalAwards)}</td>`;
+      html += `<td style="color:${t.netFlow >= 0 ? '#00ff88' : '#ff4444'}">${t.netFlow >= 0 ? '+' : ''}${fmtSats(t.netFlow)}</td>`;
+      html += `<td>${fmt(t.totalTicks)}</td></tr>`;
+    }
+    html += `</table>`;
+  }
+
+  // Hub & spoke visual for latest table
+  const allChannels = await fetchJSON('/api/payment-channels');
+  if (allChannels && allChannels.length > 0) {
+    const latest = allChannels[allChannels.length - 1];
+    if (latest.channels && latest.channels.length > 0) {
+      html += `<div style="margin-top:16px; padding:12px; background:#0a0a14; border-radius:6px;">`;
+      html += `<div style="font-size:0.8em; color:#7b7baa; margin-bottom:8px;">Hub &amp; Spoke: ${latest.tableId.slice(0,14)} (latest)</div>`;
+      html += `<div style="display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:0;">`;
+      // Hub in center
+      html += `<div style="position:relative; width:280px; height:280px;">`;
+      html += `<div style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:60px; height:60px; background:#1a3a5c; border:2px solid #00d4ff; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:0.65em; color:#00d4ff; text-align:center; z-index:2;">HUB<br>${latest.tableId.slice(0,6)}</div>`;
+      const n = latest.channels.length;
+      for (let i = 0; i < n; i++) {
+        const ch = latest.channels[i];
+        const angle = (2 * Math.PI * i / n) - Math.PI / 2;
+        const cx = 140 + Math.cos(angle) * 110;
+        const cy = 140 + Math.sin(angle) * 110;
+        const color = ch.netFlow >= 0 ? '#00ff88' : '#ff4444';
+        // Spoke line (SVG overlay)
+        const lx = 140 + Math.cos(angle) * 30;
+        const ly = 140 + Math.sin(angle) * 30;
+        const ex = 140 + Math.cos(angle) * 85;
+        const ey = 140 + Math.sin(angle) * 85;
+        html += `<svg style="position:absolute; top:0; left:0; width:280px; height:280px; pointer-events:none; z-index:1;"><line x1="${lx}" y1="${ly}" x2="${ex}" y2="${ey}" stroke="${color}" stroke-width="1.5" stroke-dasharray="4,2" opacity="0.6"/></svg>`;
+        // Player node
+        html += `<div style="position:absolute; left:${cx - 38}px; top:${cy - 22}px; width:76px; text-align:center; font-size:0.6em; z-index:2;">`;
+        html += `<div style="background:#12121f; border:1px solid ${color}; border-radius:4px; padding:2px 4px;">`;
+        html += `<div style="color:#ccc;">${ch.playerId.slice(0,8)}</div>`;
+        html += `<div style="color:${color};">${ch.netFlow >= 0 ? '+' : ''}${ch.netFlow}s</div>`;
+        html += `</div></div>`;
+      }
+      html += `</div>`; // relative container
+      html += `</div>`; // flex
+      html += `</div>`; // outer
+    }
+  }
+
+  el.innerHTML = html;
+}
+
+// ── EMA → Paskian Responsiveness ──
+async function refreshEMAPaskian() {
+  const [ema, stable, emerging] = await Promise.all([
+    fetchJSON('/api/swarm-ema'),
+    fetchJSON('/api/paskian/stable-threads'),
+    fetchJSON('/api/paskian/emerging-threads'),
+  ]);
+  const el = document.getElementById('ema-paskian');
+  if (!ema || !ema.totalPlayers) return;
+
+  let html = '';
+
+  // EMA drift events row
+  html += `<div style="padding:8px; background:#0a0a14; border-radius:4px; margin-bottom:8px;">`;
+  html += `<div style="font-size:0.8em; color:#00d4ff; margin-bottom:6px;">EMA Drift Events</div>`;
+  const personas = Object.entries(ema.byPersona || {});
+  if (personas.length > 0) {
+    html += `<div style="display:flex; gap:8px; flex-wrap:wrap;">`;
+    for (const [persona, stats] of personas) {
+      const drift = stats.avgWinRate - 0.25;
+      const driftLabel = drift > 0.05 ? 'WINNING' : drift < -0.05 ? 'LOSING' : 'STABLE';
+      const driftColor = drift > 0.05 ? '#00ff88' : drift < -0.05 ? '#ff4444' : '#888';
+      html += `<div style="background:#12121f; border:1px solid ${driftColor}; border-radius:4px; padding:4px 8px; font-size:0.75em;">`;
+      html += `<div style="color:#ccc;">${persona} (${stats.count})</div>`;
+      html += `<div style="color:${driftColor};">${driftLabel} ${(drift * 100).toFixed(1)}%</div>`;
+      html += `</div>`;
+    }
+    html += `</div>`;
+  } else {
+    html += `<div class="empty">No EMA data yet</div>`;
+  }
+  html += `</div>`;
+
+  // Arrow connector
+  html += `<div style="text-align:center; color:#444; font-size:1.2em; margin:4px 0;">&#8595; triggers &#8595;</div>`;
+
+  // Paskian thread detection row
+  html += `<div style="padding:8px; background:#0a0a14; border-radius:4px;">`;
+  html += `<div style="font-size:0.8em; color:#ffd700; margin-bottom:6px;">Paskian Thread Detection</div>`;
+
+  const allThreads = [...(stable || []), ...(emerging || [])];
+  if (allThreads.length > 0) {
+    html += `<div style="display:flex; flex-direction:column; gap:8px;">`;
+    for (const t of allThreads) {
+      const isStable = (stable || []).includes(t);
+      const borderColor = isStable ? '#00ff88' : '#ffd700';
+      // Find EMA data for nodes in this thread
+      const nodeEmas = (ema.players || []).filter(p => t.nodes.includes(p.playerId));
+      html += `<div style="border-left:3px solid ${borderColor}; padding:6px 8px; background:#12121f; border-radius:0 4px 4px 0;">`;
+      html += `<div style="font-size:0.8em; color:${borderColor}; font-weight:bold;">${isStable ? 'STABLE' : 'EMERGING'}: ${t.label}</div>`;
+      html += `<div style="font-size:0.75em; color:#aaa; margin-top:2px;">${t.observation}</div>`;
+      if (nodeEmas.length > 0) {
+        html += `<div style="font-size:0.7em; color:#666; margin-top:4px;">`;
+        html += `EMA of nodes: `;
+        html += nodeEmas.map(p => {
+          const c = p.ema.emaWinRate > 0.25 ? '#00ff88' : '#ff4444';
+          return `<span style="color:${c}">${p.persona} ${(p.ema.emaWinRate*100).toFixed(0)}%WR</span>`;
+        }).join(', ');
+        html += `</div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div>`;
+  } else {
+    html += `<div class="empty">No Paskian threads detected yet</div>`;
+  }
+  html += `</div>`;
+
+  el.innerHTML = html;
+}
+
+// ── TPS Gauge ──
+const tpsHistory = [];
+let peakTps = 0;
+
+async function refreshTPSGauge() {
+  const d = await fetchJSON('/api/stats');
+  if (!d) return;
+
+  const uptime = d.uptimeMs || (Date.now() - d.startTime) || 1;
+  const currentTps = parseFloat((d.totalTxCount / (uptime / 1000)).toFixed(1));
+
+  tpsHistory.push(currentTps);
+  if (tpsHistory.length > 30) tpsHistory.shift();
+  if (currentTps > peakTps) peakTps = currentTps;
+
+  document.getElementById('tps-current').textContent = currentTps.toFixed(1);
+  document.getElementById('tps-peak').textContent = peakTps.toFixed(1);
+
+  // Bar chart
+  const chartEl = document.getElementById('tps-chart');
+  const maxVal = Math.max(peakTps, 1);
+  chartEl.innerHTML = tpsHistory.map((v, i) => {
+    const h = Math.max(2, (v / maxVal) * 56);
+    const opacity = 0.4 + (i / tpsHistory.length) * 0.6;
+    const color = v >= peakTps * 0.8 ? '#ffd700' : v >= peakTps * 0.5 ? '#00d4ff' : '#334';
+    return `<div style="flex:1; min-width:4px; max-width:12px; height:${h}px; background:${color}; border-radius:1px 1px 0 0; opacity:${opacity};" title="TPS: ${v}"></div>`;
+  }).join('');
+}
+
 // ── Refresh loop ──
 async function refresh() {
   await Promise.all([
@@ -453,6 +648,9 @@ async function refresh() {
     refreshSwarmEMA(),
     refreshPaskian(),
     refreshExportStats(),
+    refreshPaymentChannels(),
+    refreshEMAPaskian(),
+    refreshTPSGauge(),
   ]);
 }
 
