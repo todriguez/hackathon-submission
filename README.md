@@ -47,6 +47,13 @@ Every arrow is auditable. Every CellToken is on BSV mainnet. Every policy versio
 │  All LINEAR typed, hash-chained, broadcast to BSV mainnet       │
 │  Target: 1.5M+ meaningful state transitions in 24 hours         │
 │                                                                 │
+│  SwarmEMA: each bot adapts via EMA (α=0.05) — negative          │
+│  feedback loop creates emergent equilibrium without coordination │
+│                                                                 │
+│  Paskian observes the swarm: detects converged strategies        │
+│  (stable threads), rising/falling trends (emerging threads),     │
+│  and dominant behavioral states across the floor                 │
+│                                                                 │
 │  This is the training data. It's on-chain. It's provable.       │
 └──────────────────────┬──────────────────────────────────────────┘
                        │ Shadow loops observe via border router
@@ -193,6 +200,56 @@ The 2PDA kernel validates every transition against the compiled poker policies. 
 
 The dashboard shows caught vs undetected attempts in real-time, and the audit CSV includes every attempt with its CellToken hash.
 
+## Paskian Learning — Swarm Pattern Detection
+
+The floor bots aren't static — each has a **SwarmEMA** (Exponential Moving Average, α=0.05) that tracks its win rate and chip delta over time. When a bot loses consistently, the EMA tightens its play (higher fold threshold, lower aggression). When it wins, the EMA loosens it. This creates a **negative feedback loop**: the entire swarm converges toward equilibrium without any central coordination.
+
+The **Paskian Learning Layer** sits above this swarm and observes the emergent behavior. It ingests four signal types from the border-router:
+
+| Signal | Source | Strength |
+|---|---|---|
+| `SWARM_WINNING` | EMA drift > +0.05 | `drift × 4` (normalized to [-1, 1]) |
+| `SWARM_LOSING` | EMA drift < -0.05 | `drift × 4` |
+| `SWARM_STABLE` | EMA drift ≈ 0 | `drift × 4` |
+| `HAND_WON` / `HAND_LOST` / `FOLD` / `RAISE` | Per-hand reports | Pot-normalized |
+
+Paskian tracks per-node state using its own EMA (configurable learning rate) and detects two kinds of behavioral threads:
+
+**Stable Threads** — converged patterns where a cluster of nodes shows low variance:
+
+```
+Stable Thread: "Converged: SWARM_WINNING"
+  Nodes: [bot-aggressive, bot-tight]
+  Stability: 0.97
+  Observation: "2 players consistently winning (avg strength 0.312).
+    Swarm has converged on effective strategies — the EMA adaptation
+    has found a stable equilibrium."
+```
+
+**Emerging Threads** — trends developing within a time window:
+
+```
+Emerging Thread: "Emerging: Swarm Pressure"
+  Nodes: [bot-passive, bot-random]
+  Stability: 0.30
+  Observation: "2 players showing declining trend. Competitive pressure
+    from adapted opponents is pushing their win rates down —
+    the swarm is reshuffling."
+```
+
+The detection algorithm:
+1. Group nodes by behavioral kind (WINNING/LOSING/STABLE)
+2. For each group with ≥2 nodes and ≥5 history entries, compute variance of strength history
+3. If variance < ε (configurable), the group is a **stable thread**
+4. For emerging threads: check if the last 5 strength values are monotonically increasing or decreasing (Δ > 0.01)
+5. Detect dominant states when one kind has >2× the player count of any other
+
+This is exposed via the dashboard at `/api/paskian/stable-threads` and `/api/paskian/emerging-threads`, auto-refreshing every 2 seconds.
+
+**Why this matters for the hackathon**: the floor bots aren't just generating transaction volume — they're producing *detectable behavioral patterns* that a higher-order system (Paskian) can observe and report on. The apex predators consume these observations when deciding which floor tables to target. It's agents observing agents observing agents — all grounded in on-chain provable data.
+
+**Tested with 26 tests and 64 assertions** covering: EMA smoothing, stable thread detection (winning/losing/stable clusters), emerging trend detection (improving/declining), dominant state detection, high-variance rejection, threshold enforcement (minInteractions, history length), realistic 100-hand swarm simulation, and human-readable observation output.
+
 ## Payment Channels — Hub-and-Spoke
 
 Traditional payment channels are bilateral: Alice opens a channel with Bob, they exchange signed state updates off-chain, and settle on-chain when done. This doesn't work for multi-player poker — when 4 players bet into a communal pot, you'd need O(n²) bilateral channels and there's no clean way to route pot winnings.
@@ -313,6 +370,9 @@ open http://localhost:9090
 | `GET /api/agent-matchups` | Agent-vs-agent results |
 | `GET /api/settlements` | Apex roam settlement records |
 | `GET /api/tx-dag` | CellToken chain visualisation |
+| `GET /api/swarm-ema` | Current EMA state of all tracked players |
+| `GET /api/paskian/stable-threads` | Converged behavioral patterns |
+| `GET /api/paskian/emerging-threads` | Developing trends + dominant states |
 | `GET /api/audit/export` | CSV: all txids (hackathon proof) |
 | `GET /api/cells/export` | CSV: full CellToken data + game state |
 | `GET /api/cells/export/stats` | Preview export file sizes |
@@ -374,7 +434,8 @@ Today the CellTokens use PushDrop for mainnet compatibility. When miners adopt t
 │   └── cell-engine/                 # Host function registry
 ├── opcodes/                         # Plexus VM (Zig + Lean4 + TLA+)
 ├── test/                            # TDD test suite (bun test)
-│   └── table-payment-hub.test      # 24 tests, 87 assertions
+│   ├── table-payment-hub.test      # 24 tests, 87 assertions
+│   └── paskian.test                # 26 tests, 64 assertions
 ├── scripts/                         # Funding, export, audit tools
 ├── Dockerfile                       # Multi-stage build
 └── docker-compose.yml               # Full 13-container swarm
