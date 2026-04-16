@@ -31,7 +31,7 @@ x-floor-base: &floor-base
   init: true
   restart: "no"
   volumes:
-    - audit-logs:/audit:rw
+    - ./audit:/audit:rw
     - ./data:/funding:ro
   depends_on:
     router:
@@ -72,7 +72,7 @@ x-apex-base: &apex-base
   init: true
   restart: "no"
   volumes:
-    - audit-logs:/audit:rw
+    - ./audit:/audit:rw
     - ./data:/funding:ro
   depends_on:
     router:
@@ -274,7 +274,7 @@ services:
     networks:
       - casino-mesh
     volumes:
-      - audit-logs:/audit:rw
+      - ./audit:/audit:rw
     environment:
       METRICS_PORT: "9090"
       AUDIT_LOG_DIR: /audit
@@ -293,9 +293,6 @@ services:
       timeout: 5s
       start_period: 5s
       retries: 3
-
-volumes:
-  audit-logs:
 
 networks:
   casino-mesh:

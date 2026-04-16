@@ -1199,6 +1199,7 @@ const server = Bun.serve({
 
     // GET /api/report-data — comprehensive data dump for Opus blinded report generation
     if (url.pathname === '/api/report-data' && req.method === 'GET') {
+      return (async () => {
       // Sample significant hands (highest pots, most actions)
       const sortedHands = [...hands].sort((a, b) => {
         const potA = botStats.get(a.winner)?.totalPotWon ?? 0;
@@ -1247,9 +1248,41 @@ const server = Bun.serve({
         showdownWinPct: ps.showdownCount > 0 ? (ps.showdownWins / ps.showdownCount * 100).toFixed(1) + '%' : '—',
       }));
 
-      // Cell overlay stats
-      const cellCount = (overlayDb.prepare('SELECT COUNT(*) as count FROM cells').get() as any)?.count ?? 0;
-      const totalFee = (overlayDb.prepare('SELECT SUM(estimated_fee_sats) as total FROM cells').get() as any)?.total ?? 0;
+      // Cell overlay stats — in-memory shadow DB (resets on router restart).
+      const overlayCellCount = (overlayDb.prepare('SELECT COUNT(*) as count FROM cells').get() as any)?.count ?? 0;
+      const overlayTotalFee = (overlayDb.prepare('SELECT SUM(estimated_fee_sats) as total FROM cells').get() as any)?.total ?? 0;
+
+      // True on-chain broadcast count — read the append-only audit CSVs written
+      // by every floor/apex DirectBroadcastEngine. These persist across router
+      // restarts in the shared /audit volume, so this is the ground truth for
+      // "how many CellTokens actually hit ARC". Each row = one broadcast attempt.
+      // Schema: txid,type,sats_in,fee_sats,est_bytes,timestamp
+      let auditCellCount = 0;
+      let auditTotalFee = 0;
+      try {
+        const { readdirSync, readFileSync } = await import('fs');
+        const auditDir = process.env.AUDIT_LOG_DIR ?? '/audit';
+        const files = readdirSync(auditDir).filter(f => f.startsWith('txids-') && f.endsWith('.csv'));
+        for (const f of files) {
+          const content = readFileSync(`${auditDir}/${f}`, 'utf8');
+          const lines = content.split('\n').filter(l => l.length > 0);
+          if (lines.length === 0) continue;
+          const dataRows = lines.slice(1); // skip header
+          auditCellCount += dataRows.length;
+          for (const row of dataRows) {
+            const cols = row.split(',');
+            const fee = Number(cols[3] ?? 0);
+            if (Number.isFinite(fee)) auditTotalFee += fee;
+          }
+        }
+      } catch (e) {
+        // Audit dir missing or unreadable — fall through, overlay counts still reported.
+      }
+
+      // Prefer audit-CSV counts when available (they're ground truth); fall back
+      // to overlay DB if audit is unreachable.
+      const cellCount = auditCellCount > 0 ? auditCellCount : overlayCellCount;
+      const totalFee = auditTotalFee > 0 ? auditTotalFee : overlayTotalFee;
 
       // Payment channel summary
       let channelSummary = { totalBets: 0, totalAwards: 0, totalTicks: 0, channelCount: 0 };
@@ -1310,6 +1343,7 @@ const server = Bun.serve({
           return { id, model: rebuy?.model ?? 'unknown', rebuys: rebuy?.count ?? 0, costSats: rebuy?.costSats ?? 0 };
         }),
       }, { headers: corsHeaders });
+      })();
     }
 
     // POST /api/generate-report — trigger Opus blinded analysis report
