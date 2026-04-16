@@ -51,6 +51,8 @@ const OVERLAY_DB_PATH = process.env.OVERLAY_DB ?? 'data/overlay.sqlite';
 import { mkdirSync } from 'fs';
 try { mkdirSync('data', { recursive: true }); } catch {}
 const overlayDb = new Database(OVERLAY_DB_PATH);
+overlayDb.run('PRAGMA journal_mode = WAL');
+overlayDb.run('PRAGMA synchronous = NORMAL');
 overlayDb.run(`
   CREATE TABLE IF NOT EXISTS cells (
     shadow_txid TEXT PRIMARY KEY,
@@ -1892,30 +1894,36 @@ console.log(`[BorderRouter] AnchorIngress active — audit: ${AUDIT_LOG_DIR}/bsv
           const cells = body?.cells ?? [];
           totalCellsIngested += cells.length;
           const sourceId = body?.sourceId ?? null;
-          for (const c of cells) {
-            try {
-              insertCell.run(
-                c.shadowTxid ?? c.shadow_txid ?? '',
-                c.handId ?? c.hand_id ?? '',
-                c.phase ?? '',
-                c.version ?? 0,
-                c.semanticPath ?? c.semantic_path ?? '',
-                c.contentHash ?? c.content_hash ?? '',
-                c.cellHash ?? c.cell_hash ?? '',
-                c.prevStateHash ?? c.prev_state_hash ?? null,
-                c.ownerPubkey ?? c.owner_pubkey ?? '',
-                c.linearity ?? 'LINEAR',
-                c.cellSize ?? c.cell_size ?? 0,
-                typeof c.statePayload === 'string' ? c.statePayload : JSON.stringify(c.statePayload ?? c.state_payload ?? {}),
-                c.fullScriptHex ?? c.full_script_hex ?? '',
-                c.estimatedBytes ?? c.estimated_bytes ?? 0,
-                c.estimatedFeeSats ?? c.estimated_fee_sats ?? 0,
-                c.sourceId ?? c.source_id ?? sourceId,
-                c.timestamp ?? Date.now(),
-              );
-            } catch {
-              // Duplicate shadow_txid (PRIMARY KEY) or schema mismatch — skip.
+          try {
+            overlayDb.run('BEGIN');
+            for (const c of cells) {
+              try {
+                insertCell.run(
+                  c.shadowTxid ?? c.shadow_txid ?? '',
+                  c.handId ?? c.hand_id ?? '',
+                  c.phase ?? '',
+                  c.version ?? 0,
+                  c.semanticPath ?? c.semantic_path ?? '',
+                  c.contentHash ?? c.content_hash ?? '',
+                  c.cellHash ?? c.cell_hash ?? '',
+                  c.prevStateHash ?? c.prev_state_hash ?? null,
+                  c.ownerPubkey ?? c.owner_pubkey ?? '',
+                  c.linearity ?? 'LINEAR',
+                  c.cellSize ?? c.cell_size ?? 0,
+                  typeof c.statePayload === 'string' ? c.statePayload : JSON.stringify(c.statePayload ?? c.state_payload ?? {}),
+                  c.fullScriptHex ?? c.full_script_hex ?? '',
+                  c.estimatedBytes ?? c.estimated_bytes ?? 0,
+                  c.estimatedFeeSats ?? c.estimated_fee_sats ?? 0,
+                  c.sourceId ?? c.source_id ?? sourceId,
+                  c.timestamp ?? Date.now(),
+                );
+              } catch {
+                // Duplicate shadow_txid (PRIMARY KEY) or schema mismatch — skip.
+              }
             }
+            overlayDb.run('COMMIT');
+          } catch {
+            try { overlayDb.run('ROLLBACK'); } catch {}
           }
         },
         onTxCount: (body) => {

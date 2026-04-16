@@ -29,7 +29,7 @@ x-floor-base: &floor-base
   networks:
     - casino-mesh
   init: true
-  restart: ${FLOOR_RESTART:-"no"}
+  restart: "no"
   volumes:
     - audit-logs:/audit:rw
     - ./data:/funding:ro
@@ -49,7 +49,7 @@ x-floor-env: &floor-env
   SMALL_BLIND: "5"
   BIG_BLIND: "10"
   FEE_RATE: ${FEE_RATE:-0.1}
-  MIN_FEE: ${MIN_FEE:-136}
+  MIN_FEE: ${MIN_FEE:-138}
   SPLIT_SATS: ${SPLIT_SATS:-2000}
   ARC_URL: ${ARC_URL:-https://arc.gorillapool.io}
   ARC_API_KEY: ${ARC_API_KEY:-}
@@ -93,7 +93,7 @@ x-apex-env: &apex-env
   WALLET_FUNDING_SATS: ${WALLET_FUNDING_SATS:-100000}
   MSGBOX_HOST: ${MSGBOX_HOST:-https://messagebox.babbage.systems}
   FEE_RATE: ${FEE_RATE:-0.1}
-  MIN_FEE: ${MIN_FEE:-136}
+  MIN_FEE: ${MIN_FEE:-138}
   SPLIT_SATS: ${SPLIT_SATS:-2000}
   ARC_URL: ${ARC_URL:-https://arc.gorillapool.io}
   ARC_API_KEY: ${ARC_API_KEY:-}

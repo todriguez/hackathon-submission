@@ -239,6 +239,17 @@ async function legacyPreFund() {
     process.exit(1);
   }
 
+  // Filter to confirmed-only UTXOs when CONFIRMED_ONLY=1 (avoids mempool contamination)
+  if (process.env.CONFIRMED_ONLY === '1') {
+    const before = utxos.length;
+    utxos = utxos.filter((u: any) => u.height > 0);
+    console.log(`  CONFIRMED_ONLY: ${utxos.length}/${before} UTXOs have confirmations`);
+    if (utxos.length === 0) {
+      console.error('  ERROR: No confirmed UTXOs found!');
+      process.exit(1);
+    }
+  }
+
   // FUNDING_BUDGET caps the total sats to consume (e.g. 5000000 for 0.05 BSV).
   // Sort largest-first so we minimise the number of inputs (fewer source-tx fetches).
   const fundingBudget = Number(process.env.FUNDING_BUDGET ?? '0');

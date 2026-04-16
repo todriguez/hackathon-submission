@@ -112,21 +112,11 @@ async function initBroadcastEngine(): Promise<void> {
     console.log(`[casino-floor-${BOT_INDEX}] Change sweep to: ${CHANGE_ADDRESS}`);
   }
 
-  // Strategy: try discovering existing on-chain UTXOs first (from previous runs).
-  // Only fall back to pre-split if no UTXOs found.
-  const TOTAL_FLOOR_NODES = 8;
+  // Strategy: use dedicated fan-out UTXO first (isolated per container).
+  // Only fall back to on-chain discovery if no funding tx provided.
   let funded = false;
-  try {
-    const discovered = await broadcastEngine.discoverUtxos(BOT_INDEX, TOTAL_FLOOR_NODES);
-    if (discovered.count >= TABLES_PER_NODE) {
-      console.log(`[casino-floor-${BOT_INDEX}] Using ${discovered.count} discovered UTXOs (${discovered.totalSats.toLocaleString()} sats)`);
-      funded = true;
-    }
-  } catch (discErr: any) {
-    console.log(`[casino-floor-${BOT_INDEX}] UTXO discovery: ${discErr.message}`);
-  }
 
-  if (!funded && FUNDING_TX_HEX) {
+  if (FUNDING_TX_HEX) {
     try {
       const funding = await broadcastEngine.ingestFunding(FUNDING_TX_HEX, FUNDING_VOUT);
       await broadcastEngine.preSplit(funding);
@@ -134,6 +124,19 @@ async function initBroadcastEngine(): Promise<void> {
       funded = true;
     } catch (splitErr: any) {
       console.log(`[casino-floor-${BOT_INDEX}] Pre-split failed: ${splitErr.message}`);
+    }
+  }
+
+  if (!funded) {
+    const TOTAL_FLOOR_NODES = 8;
+    try {
+      const discovered = await broadcastEngine.discoverUtxos(BOT_INDEX, TOTAL_FLOOR_NODES);
+      if (discovered.count >= TABLES_PER_NODE) {
+        console.log(`[casino-floor-${BOT_INDEX}] Using ${discovered.count} discovered UTXOs (${discovered.totalSats.toLocaleString()} sats)`);
+        funded = true;
+      }
+    } catch (discErr: any) {
+      console.log(`[casino-floor-${BOT_INDEX}] UTXO discovery: ${discErr.message}`);
     }
   }
 
