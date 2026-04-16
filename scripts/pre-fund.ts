@@ -233,14 +233,30 @@ async function legacyPreFund() {
     process.exit(1);
   }
 
-  const utxos: any[] = await resp.json();
+  let utxos: any[] = await resp.json();
   if (utxos.length === 0) {
     console.error('  ERROR: No UTXOs found. Fund the address first!');
     process.exit(1);
   }
 
+  // FUNDING_BUDGET caps the total sats to consume (e.g. 5000000 for 0.05 BSV).
+  // Sort largest-first so we minimise the number of inputs (fewer source-tx fetches).
+  const fundingBudget = Number(process.env.FUNDING_BUDGET ?? '0');
+  if (fundingBudget > 0) {
+    utxos.sort((a: any, b: any) => b.value - a.value);
+    let cumSats = 0;
+    const selected: any[] = [];
+    for (const u of utxos) {
+      selected.push(u);
+      cumSats += u.value;
+      if (cumSats >= fundingBudget) break;
+    }
+    console.log(`  FUNDING_BUDGET=${fundingBudget.toLocaleString()} sats — using ${selected.length}/${utxos.length} UTXOs (${cumSats.toLocaleString()} sats)`);
+    utxos = selected;
+  }
+
   const totalSats = utxos.reduce((s: number, u: any) => s + u.value, 0);
-  console.log(`  Found ${utxos.length} UTXOs totaling ${totalSats.toLocaleString()} sats (${(totalSats / 1e8).toFixed(4)} BSV)`);
+  console.log(`  Using ${utxos.length} UTXOs totaling ${totalSats.toLocaleString()} sats (${(totalSats / 1e8).toFixed(4)} BSV)`);
 
   // Fetch full tx hex for each UTXO
   const fundingInputs: Array<{ txid: string; vout: number; sats: number; sourceTx: Transaction }> = [];
@@ -362,7 +378,12 @@ function writeEnvLive(txid: string, beefHex: string, wif: string, changeAddr: st
     `CHANGE_ADDRESS=${changeAddr}`,
     `ANCHOR_MODE=live`,
     `FUNDING_TX_HEX_FILE=/funding/funding-tx.hex`,
-    // Per-container vouts are in docker-compose
+    // Apex LLM config
+    `LLM_PROVIDER=${process.env.LLM_PROVIDER ?? 'anthropic'}`,
+    `ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY ?? ''}`,
+    `# GorillaPool ARC — honest broadcaster`,
+    `ARC_URL=${process.env.ARC_URL ?? 'https://arc.gorillapool.io'}`,
+    `ARC_API_KEY=${process.env.ARC_API_KEY ?? ''}`,
   ];
 
   writeFileSync('.env.live', envLines.join('\n') + '\n');

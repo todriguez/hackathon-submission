@@ -37,6 +37,15 @@ import {
 import { RealUdpTransport } from './protocol/adapters/udp-transport';
 import { DirectBroadcastEngine } from './agent/direct-broadcast-engine';
 import { TablePaymentHub } from './engine/table-payment-hub';
+import {
+  publishHand,
+  publishPlayerStats,
+  publishSwarmEMA,
+  publishElimination,
+  publishPremiumHand,
+  publishCells,
+  publishTxCount,
+} from './floor-multicast-publish';
 
 // ── Config ──
 
@@ -218,20 +227,13 @@ function reportHand(
     winner: winner.identity.playerId,
   };
 
-  telemetryBatch.hands.push({ hand, txCount, potSize, tableId });
-
-  // Publish hand result on multicast (still direct — UDP, no overhead)
+  // Multicast-first: when the UDP observer is live, publish there and skip the
+  // HTTP batch push to avoid double-counting at the router. HTTP remains the
+  // fallback when multicast isn't configured.
   if (multicast) {
-    try {
-      const cellBytes = new TextEncoder().encode(JSON.stringify({ tableId, handNumber, winner: winner.identity.playerId, pot: potSize }));
-      multicast.publish({
-        cellBytes,
-        semanticPath: `game/poker/${tableId}/hand-${handNumber}/result`,
-        contentHash: '',
-        ownerCert: '',
-        typeHash: 'poker-hand-result',
-      }, { topic: `table/${tableId}/hands` }).catch(() => {});
-    } catch {}
+    publishHand(multicast, tableId, hand as any, txCount, potSize, handNumber).catch(() => {});
+  } else {
+    telemetryBatch.hands.push({ hand, txCount, potSize, tableId });
   }
 }
 
@@ -240,16 +242,18 @@ function reportPlayerStats(
   seats: SeatState[],
   handsPlayed: number,
 ): void {
-  telemetryBatch.playerStats.push({
-    tableId,
-    players: seats.map((s) => ({
-      playerId: s.identity.playerId,
-      persona: s.identity.persona.name,
-      chips: s.chips,
-      chipDelta: s.chips - STARTING_CHIPS,
-      handsPlayed,
-    })),
-  });
+  const players = seats.map((s) => ({
+    playerId: s.identity.playerId,
+    persona: s.identity.persona.name,
+    chips: s.chips,
+    chipDelta: s.chips - STARTING_CHIPS,
+    handsPlayed,
+  }));
+  if (multicast) {
+    publishPlayerStats(multicast, tableId, players).catch(() => {});
+  } else {
+    telemetryBatch.playerStats.push({ tableId, players });
+  }
 }
 
 // ── Table Runner ──
@@ -325,7 +329,11 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
     enableSwarmEMA: true,
     swarmEMAAlpha: 0.05,
     onSwarmUpdate: (snapshots) => {
-      telemetryBatch.swarmEma.push({ tableId, snapshots, timestamp: Date.now() });
+      if (multicast) {
+        publishSwarmEMA(multicast, tableId, snapshots as any[]).catch(() => {});
+      } else {
+        telemetryBatch.swarmEma.push({ tableId, snapshots, timestamp: Date.now() });
+      }
     },
     eliminationMode: ELIMINATION_MODE,
     onElimination: (bustedSeat, tid, seatIdx, handNum) => {
@@ -337,13 +345,18 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
       );
       console.log(`[floor:${tid}] ☠ ${bustedSeat.identity.playerId.slice(0, 16)} eliminated (hand ${handNum}) → replaced by ${newIdentity.playerId.slice(0, 16)}`);
       // Batch elimination report
-      telemetryBatch.eliminations.push({
+      const elim = {
         tableId: tid,
         eliminatedId: bustedSeat.identity.playerId,
         replacementId: newIdentity.playerId,
         handNumber: handNum,
         sourceId: `floor-${BOT_INDEX}`,
-      });
+      };
+      if (multicast) {
+        publishElimination(multicast, tid, elim).catch(() => {});
+      } else {
+        telemetryBatch.eliminations.push(elim);
+      }
       return {
         identity: newIdentity,
         chips: STARTING_CHIPS,
@@ -375,11 +388,20 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
       }
     },
     onCells: (cells) => {
-      telemetryBatch.cells.push({ cells, sourceId: `floor-${BOT_INDEX}/${tableId}` });
+      const sourceId = `floor-${BOT_INDEX}/${tableId}`;
+      if (multicast) {
+        publishCells(multicast, sourceId, cells as any[]).catch(() => {});
+      } else {
+        telemetryBatch.cells.push({ cells, sourceId });
+      }
     },
     onPremiumHand: (event) => {
       console.log(`[floor:${tableId}] 🃏 PREMIUM: ${event.handRank} by ${event.playerId.slice(0, 16)} — ${event.cards}`);
-      telemetryBatch.premiumHands.push({ ...event, tableId, timestamp: Date.now() });
+      if (multicast) {
+        publishPremiumHand(multicast, tableId, event as any).catch(() => {});
+      } else {
+        telemetryBatch.premiumHands.push({ ...event, tableId, timestamp: Date.now() });
+      }
     },
     onHandComplete: (tid, handNumber, winner, pot, actions) => {
       // Payment channel: award pot to winner (fire-and-forget)
@@ -509,18 +531,24 @@ async function main() {
     { hands: 0, txs: 0, validations: 0, rejections: 0, eliminations: 0, uniquePlayers: 0 },
   );
 
-  try {
-    await fetch(`${ROUTER_URL}/api/tx-count`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        count: totals.txs,
-        botId: `floor-${BOT_INDEX}`,
-        eliminations: totals.eliminations,
-        uniquePlayers: totals.uniquePlayers,
-      }),
-    });
-  } catch {}
+  // Multicast-first: publish final tx count on UDP; fall back to HTTP only if
+  // the multicast adapter didn't come up.
+  if (multicast) {
+    await publishTxCount(multicast, `floor-${BOT_INDEX}`, totals.txs, totals.eliminations, totals.uniquePlayers).catch(() => {});
+  } else {
+    try {
+      await fetch(`${ROUTER_URL}/api/tx-count`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          count: totals.txs,
+          botId: `floor-${BOT_INDEX}`,
+          eliminations: totals.eliminations,
+          uniquePlayers: totals.uniquePlayers,
+        }),
+      });
+    } catch {}
+  }
 
   // Final telemetry flush before shutdown
   clearInterval(telemetryFlushInterval);

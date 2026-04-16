@@ -22,6 +22,9 @@
 import type { Hand, PolicyEvolutionCell } from './agent/shadow-loop-types';
 import { PaskianAdapter } from './stubs/paskian';
 import Anthropic from '@anthropic-ai/sdk';
+import { AnchorIngress } from './anchor-ingress';
+import { createMulticastIngress } from './border-router-multicast';
+import { RealUdpTransport } from './protocol/adapters/udp-transport';
 
 // ── Paskian Learning Layer ──
 
@@ -776,9 +779,15 @@ const server = Bun.serve({
           totalUniquePlayers,
           swarmTracked: swarmEMAState.size,
           swarmUpdates: swarmUpdatesIngested,
+          anchorIngress: anchorIngress.getStats(),
         },
         { headers: corsHeaders },
       );
+    }
+
+    // GET /api/anchor-ingress — isolated BSV broadcast pipeline telemetry
+    if (url.pathname === '/api/anchor-ingress' && req.method === 'GET') {
+      return Response.json(anchorIngress.getStats(), { headers: corsHeaders });
     }
 
     // GET /api/learning-curve
@@ -1787,6 +1796,167 @@ if (WS_PORT !== METRICS_PORT) {
 }
 
 console.log(`[BorderRouter] HTTP API on :${METRICS_PORT}`);
+
+// ── Isolated BSV Broadcast Pipeline (AnchorIngress) ──
+const AUDIT_LOG_DIR = process.env.AUDIT_LOG_DIR ?? 'data';
+const anchorIngress = new AnchorIngress({
+  batchWindowMs: Number(process.env.ANCHOR_BATCH_WINDOW_MS ?? '30000'),
+  maxTxPerSec: Number(process.env.ANCHOR_MAX_TX_PER_SEC ?? '10'),
+  broadcastIndividual: process.env.ANCHOR_BROADCAST_INDIVIDUAL !== 'false',
+  auditLogPath: `${AUDIT_LOG_DIR}/bsv-ingress.csv`,
+  taalApiKey: process.env.TAAL_API_KEY ?? '',
+  verbose: true,
+});
+anchorIngress.start();
+(globalThis as any).__anchorIngress = anchorIngress;
+console.log(`[BorderRouter] AnchorIngress active — audit: ${AUDIT_LOG_DIR}/bsv-ingress.csv`);
+
+// ── Multicast Ingress (UDP observer on ff02::1:5683, botIndex=0xFFFF) ──
+(async () => {
+  try {
+    const multicastTransport = new RealUdpTransport('::0');
+    const multicastIngress = createMulticastIngress({
+      transport: multicastTransport,
+      handlers: {
+        onHand: (body) => {
+          const hand = body?.hand;
+          if (!hand) return;
+          if (hands.length >= 500) hands.shift();
+          hands.push(hand);
+          totalHandsIngested++;
+          totalTxCount += body.txCount ?? 0;
+          const potSize = body.potSize ?? 0;
+
+          // Track bot stats for ALL participants (not just myBotId, which is
+          // absent in multicast payloads — using it caused 100% win rate bug).
+          const participants = new Set<string>();
+          for (const a of hand.actions ?? []) participants.add(a.botId);
+          for (const pid of participants) {
+            const stats = getOrCreateBotStats(pid);
+            stats.handsPlayed++;
+            if (hand.winner === pid) {
+              stats.handsWon++;
+              stats.totalPotWon += potSize;
+            } else {
+              stats.totalPotLost += potSize;
+            }
+          }
+          updatePlayerStatsFromHand(hand, potSize);
+
+          // Paskian interactions — fire-and-forget
+          try {
+            const normPot = Math.min(1.0, potSize / 500);
+            if (hand.winner) {
+              const losers = (hand.showdown ?? []).filter((s: any) => !s.won).map((s: any) => s.botId);
+              paskian.interact({ cellId: hand.winner, kind: 'HAND_WON', strength: normPot, relatedCells: losers }).catch(() => {});
+              for (const loserId of losers) {
+                paskian.interact({ cellId: loserId, kind: 'HAND_LOST', strength: -normPot, relatedCells: [hand.winner] }).catch(() => {});
+              }
+            }
+            for (const a of hand.actions ?? []) {
+              if (a.type === 'fold') {
+                paskian.interact({ cellId: a.botId, kind: 'FOLD', strength: -0.05, relatedCells: [] }).catch(() => {});
+              } else if (a.type === 'raise' || a.type === 'three-bet' || a.type === 'bet') {
+                const s = Math.min(0.5, (a.amount ?? 0) / 500);
+                paskian.interact({ cellId: a.botId, kind: 'RAISE', strength: s, relatedCells: [] }).catch(() => {});
+              }
+            }
+          } catch {
+            // Paskian errors must not take down the ingress path.
+          }
+        },
+        onPlayerStats: (body) => {
+          for (const p of body?.players ?? []) {
+            const stat = getOrCreatePlayerStats(p.playerId, body.tableId, p.persona);
+            stat.chips = p.chips;
+            stat.chipDelta = p.chipDelta;
+            stat.handsPlayed = Math.max(stat.handsPlayed, p.handsPlayed ?? 0);
+            stat.lastUpdated = Date.now();
+          }
+        },
+        onSwarmEMA: (body) => {
+          swarmUpdatesIngested++;
+          for (const snap of body?.snapshots ?? []) {
+            swarmEMAState.set(snap.playerId, { ...snap, tableId: body.tableId, timestamp: body.timestamp ?? Date.now() });
+          }
+        },
+        onElimination: (body) => {
+          totalEliminations++;
+          broadcastWs({ type: 'elimination', ...body, totalEliminations });
+        },
+        onPremiumHand: (body) => {
+          premiumHands.push(body);
+          broadcastWs({ type: 'premium-hand', ...body, totalPremium: premiumHands.length });
+        },
+        onCells: (body) => {
+          const cells = body?.cells ?? [];
+          totalCellsIngested += cells.length;
+          const sourceId = body?.sourceId ?? null;
+          for (const c of cells) {
+            try {
+              insertCell.run(
+                c.shadowTxid ?? c.shadow_txid ?? '',
+                c.handId ?? c.hand_id ?? '',
+                c.phase ?? '',
+                c.version ?? 0,
+                c.semanticPath ?? c.semantic_path ?? '',
+                c.contentHash ?? c.content_hash ?? '',
+                c.cellHash ?? c.cell_hash ?? '',
+                c.prevStateHash ?? c.prev_state_hash ?? null,
+                c.ownerPubkey ?? c.owner_pubkey ?? '',
+                c.linearity ?? 'LINEAR',
+                c.cellSize ?? c.cell_size ?? 0,
+                typeof c.statePayload === 'string' ? c.statePayload : JSON.stringify(c.statePayload ?? c.state_payload ?? {}),
+                c.fullScriptHex ?? c.full_script_hex ?? '',
+                c.estimatedBytes ?? c.estimated_bytes ?? 0,
+                c.estimatedFeeSats ?? c.estimated_fee_sats ?? 0,
+                c.sourceId ?? c.source_id ?? sourceId,
+                c.timestamp ?? Date.now(),
+              );
+            } catch {
+              // Duplicate shadow_txid (PRIMARY KEY) or schema mismatch — skip.
+            }
+          }
+        },
+        onTxCount: (body) => {
+          totalTxCount += body?.count ?? 0;
+          if (body?.eliminations) totalEliminations += body.eliminations;
+          if (body?.uniquePlayers) totalUniquePlayers += body.uniquePlayers;
+          broadcastWs({
+            type: 'tx-batch',
+            botId: body?.botId,
+            count: body?.count ?? 0,
+            totalTx: totalTxCount,
+          });
+        },
+        onAnchor: (body) => {
+          if (!body?.rawTxHex || !body?.txid) return;
+          anchorIngress.ingest({
+            rawTxHex: body.rawTxHex,
+            txid: body.txid,
+            tableId: body.tableId ?? 'unknown',
+            handNumber: body.handNumber,
+            type: body.type ?? 'CellToken',
+            receivedAt: Date.now(),
+          });
+        },
+      },
+    });
+    await multicastIngress.start();
+    console.log(`[BorderRouter] Multicast ingress active — listening on ff02::1:5683 as observer (0xFFFF)`);
+
+    setInterval(() => {
+      const peers = multicastIngress.getAdapter().discoverPeers();
+      if (peers.length > 0) {
+        console.log(`[BorderRouter:multicast] Peers: ${peers.map(p => `bot-${p.botIndex}(${p.persona ?? 'floor'})`).join(', ')}`);
+      }
+    }, 15_000);
+  } catch (err) {
+    console.error(`[BorderRouter] Multicast ingress failed to start: ${err}`);
+    console.log(`[BorderRouter] Falling back to HTTP-only ingestion (degraded mode)`);
+  }
+})();
+
 console.log(`[BorderRouter] Ready — waiting for bot connections`);
 
 // ── Periodic dashboard push (every 2s) — keeps dashboard alive without per-hand WS sends ──

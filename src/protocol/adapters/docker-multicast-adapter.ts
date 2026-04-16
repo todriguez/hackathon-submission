@@ -154,6 +154,7 @@ export class DockerMulticastAdapter implements NetworkAdapter {
   private readonly peers = new Map<string, PeerInfo>();
   private readonly objects = new Map<string, NetworkResult>();
   private readonly subscribers = new Map<string, Set<(event: NetworkEvent) => void>>();
+  private readonly globalCellCallbacks: ((event: NetworkEvent) => void)[] = [];
   private readonly peerOfflineCallbacks: ((peer: PeerInfo) => void)[] = [];
   private readonly controlCallbacks: ((msg: ControlMessage, rinfo: RemoteInfo) => void)[] = [];
 
@@ -249,6 +250,9 @@ export class DockerMulticastAdapter implements NetworkAdapter {
     // Fire local subscribers
     const event: NetworkEvent = { type: 'object_published', result, timestamp: now };
     this.fireSubscribers(topic, event);
+    for (const cb of this.globalCellCallbacks) {
+      try { cb(event); } catch { /* isolate observer errors */ }
+    }
 
     return publishResult;
   }
@@ -321,6 +325,19 @@ export class DockerMulticastAdapter implements NetworkAdapter {
 
   onPeerOffline(cb: (peer: PeerInfo) => void): void {
     this.peerOfflineCallbacks.push(cb);
+  }
+
+  /**
+   * Register a callback fired for every received cell (MSG_CELL), regardless of
+   * topic. Returns an unsubscribe function. Enables topic-agnostic observers
+   * like the border router's multicast ingress.
+   */
+  onAnyCell(cb: (event: NetworkEvent) => void): () => void {
+    this.globalCellCallbacks.push(cb);
+    return () => {
+      const idx = this.globalCellCallbacks.indexOf(cb);
+      if (idx >= 0) this.globalCellCallbacks.splice(idx, 1);
+    };
   }
 
   onControlMessage(cb: (msg: ControlMessage, rinfo: RemoteInfo) => void): void {
@@ -425,6 +442,9 @@ export class DockerMulticastAdapter implements NetworkAdapter {
 
       const event: NetworkEvent = { type: 'object_published', result, timestamp: Date.now() };
       this.fireSubscribers(wire.topic, event);
+      for (const cb of this.globalCellCallbacks) {
+        try { cb(event); } catch { /* isolate observer errors */ }
+      }
     } catch {
       // Malformed cell — ignore
     }

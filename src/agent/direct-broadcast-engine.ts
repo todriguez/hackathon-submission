@@ -366,7 +366,15 @@ export class DirectBroadcastEngine {
       const result = await tx.broadcast(this.arc);
       if ('status' in result && result.status === 'error') {
         const fail = result as any;
-        this.log('SPLIT', `ARC error (will retry via WoC): code=${fail.code} desc=${fail.description}`);
+        // ARC returns status:'error' for SEEN_ON_NETWORK / ALREADY_MINED — these mean
+        // the tx IS on the network, so treat them as success (code 465 / 469 or desc match).
+        const desc = (fail.description || '').toLowerCase();
+        if (desc.includes('seen on network') || desc.includes('already mined') || desc.includes('already known')) {
+          this.log('SPLIT', `ARC reports tx already on network (code=${fail.code}) — treating as success`);
+          arcOk = true;
+        } else {
+          this.log('SPLIT', `ARC error (will retry via WoC): code=${fail.code} desc=${fail.description}`);
+        }
       } else {
         arcOk = true;
       }
@@ -376,21 +384,29 @@ export class DirectBroadcastEngine {
 
     const txid = tx.id('hex') as string;
 
-    // Always try WoC as backup/primary
-    const wocOk = await this.wocBroadcast(txHex);
-    this.log('SPLIT', `WoC broadcast: ${wocOk ? 'OK' : 'FAILED'}`);
+    // WoC backup only when ARC failed — saves rate-limit budget during
+    // multi-container startup where all 13 containers hit WoC simultaneously.
+    let wocOk = false;
+    if (!arcOk) {
+      wocOk = await this.wocBroadcast(txHex);
+      this.log('SPLIT', `WoC broadcast: ${wocOk ? 'OK' : 'FAILED'}`);
+    }
 
     if (!arcOk && !wocOk) {
-      // Last resort: check if tx is already on-chain (from a previous run)
-      try {
-        const checkResp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}`);
-        if (checkResp.ok) {
-          this.log('SPLIT', `Tx ${txid.slice(0, 16)}... already on-chain — proceeding`);
-        } else {
-          throw new Error(`Split broadcast failed on both ARC and WoC. txid=${txid}`);
-        }
-      } catch (checkErr: any) {
-        if (checkErr.message.includes('Split broadcast failed')) throw checkErr;
+      // Last resort: check if tx is already on-chain. Retry with backoff —
+      // WoC often 429s during multi-container startup.
+      let found = false;
+      for (let retry = 0; retry < 3 && !found; retry++) {
+        if (retry > 0) await new Promise(r => setTimeout(r, 2000 * retry));
+        try {
+          const checkResp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}`);
+          if (checkResp.ok) {
+            this.log('SPLIT', `Tx ${txid.slice(0, 16)}... already on-chain — proceeding`);
+            found = true;
+          }
+        } catch {}
+      }
+      if (!found) {
         throw new Error(`Split broadcast failed on both ARC and WoC. txid=${txid}`);
       }
     }
