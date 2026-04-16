@@ -73,13 +73,61 @@ describe('DirectBroadcastEngine chain-tip persistence', () => {
 
     expect(existsSync(chaintipPath)).toBe(true);
     const data = JSON.parse(readFileSync(chaintipPath, 'utf-8'));
+    expect(data.format).toBe('v2');
     expect(data.streams).toHaveLength(2);
     expect(data.streams[0].utxos).toHaveLength(1);
     expect(data.streams[0].utxos[0].txid).toBe('a'.repeat(64));
     expect(data.streams[0].utxos[0].satoshis).toBe(10_000);
-    expect(typeof data.streams[0].utxos[0].sourceTxHex).toBe('string');
-    expect(data.streams[0].utxos[0].sourceTxHex.length).toBeGreaterThan(20);
+    // v2: sourceTxHex lives in data.parents[txid], NOT inline per-UTXO
+    expect(data.streams[0].utxos[0].sourceTxHex).toBeUndefined();
+    expect(typeof data.parents).toBe('object');
+    expect(typeof data.parents['a'.repeat(64)]).toBe('string');
+    expect(data.parents['a'.repeat(64)].length).toBeGreaterThan(20);
     expect(typeof data.savedAt).toBe('number');
+  });
+
+  it('persistChainTip dedupes shared parents — 3200-UTXO pool stays small', async () => {
+    // REGRESSION: v1 wrote sourceTxHex per-UTXO. A pre-split creating 3200
+    // UTXOs with one ~108 KB parent tx produced a ~345 MB snapshot per flush,
+    // blocking the event loop every 5 s and freezing the broadcast engine.
+    // v2 dedupes the parent hex — this test guards the fix.
+    const engine = new DirectBroadcastEngine({ privateKeyWif: wif, streams: 16, verbose: false });
+    engine.enableChainTipPersistence(chaintipPath, 10_000);
+
+    // One big parent tx shared by all UTXOs (simulating a real pre-split output)
+    const outs = Array.from({ length: 3200 }, () => ({ satoshis: 2000 }));
+    const fundingTx = buildLocalFundingTx(PrivateKey.fromWif(wif), outs);
+    const parentTxid = 'e'.repeat(64);
+    const parentHexBytes = fundingTx.toHex().length; // hex char count
+    const streams = 16;
+    const perStream = 200; // 200 × 16 = 3200
+
+    const pools: any[] = [];
+    for (let s = 0; s < streams; s++) {
+      const pool: any[] = [];
+      for (let i = 0; i < perStream; i++) {
+        pool.push({ txid: parentTxid, vout: s * perStream + i, satoshis: 2000, sourceTx: fundingTx });
+      }
+      pools.push(pool);
+    }
+    (engine as any).utxoPools = pools;
+    (engine as any).chainTipDirty = true;
+
+    await engine.flush();
+
+    const { statSync } = await import('fs');
+    const fileSize = statSync(chaintipPath).size;
+    // v1 would be perStream*streams * parentHexBytes = 3200 * ~108_000 ≈ 345 MB.
+    // v2 is ~(parentHexBytes + 3200 rows of {txid,vout,sats}) ≈ 200-400 KB.
+    // Guardrail: under 10 MB. If this fails, dedupe regressed.
+    expect(fileSize).toBeLessThan(10 * 1024 * 1024);
+
+    const data = JSON.parse(readFileSync(chaintipPath, 'utf-8'));
+    expect(data.format).toBe('v2');
+    expect(Object.keys(data.parents)).toHaveLength(1); // ONE parent, not 3200
+    expect(data.parents[parentTxid].length).toBe(parentHexBytes);
+    const totalUtxos = data.streams.reduce((n: number, s: any) => n + s.utxos.length, 0);
+    expect(totalUtxos).toBe(3200);
   });
 
   it('restoreChainTip rehydrates utxoPools from a snapshot', async () => {

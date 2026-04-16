@@ -247,22 +247,33 @@ export class DirectBroadcastEngine {
       const data = JSON.parse(raw);
       if (!data || !Array.isArray(data.streams)) return false;
 
+      // v2 format stores parents once in `data.parents` (txid → hex map); UTXOs
+      // reference by txid. Falls back to v1 format (inline sourceTxHex per UTXO)
+      // for backward-compat with pre-dedupe snapshots.
+      const parentsMap: Record<string, string> = (data.parents && typeof data.parents === 'object') ? data.parents : {};
+      const txCache = new Map<string, Transaction>();
+      const getParentTx = (txid: string, inlineHex?: string): Transaction | null => {
+        if (txCache.has(txid)) return txCache.get(txid)!;
+        const hex = inlineHex ?? parentsMap[txid];
+        if (!hex) return null;
+        try {
+          const tx = Transaction.fromHex(hex);
+          txCache.set(txid, tx);
+          return tx;
+        } catch {
+          return null;
+        }
+      };
+
       const pools: FundingUtxo[][] = [];
       for (const stream of data.streams) {
         const utxos: FundingUtxo[] = [];
         for (const u of (stream.utxos ?? [])) {
           if (typeof u.txid !== 'string' || typeof u.vout !== 'number' ||
-              typeof u.satoshis !== 'number' || typeof u.sourceTxHex !== 'string') continue;
-          try {
-            utxos.push({
-              txid: u.txid,
-              vout: u.vout,
-              satoshis: u.satoshis,
-              sourceTx: Transaction.fromHex(u.sourceTxHex),
-            });
-          } catch {
-            // Skip corrupt entry but keep others.
-          }
+              typeof u.satoshis !== 'number') continue;
+          const sourceTx = getParentTx(u.txid, typeof u.sourceTxHex === 'string' ? u.sourceTxHex : undefined);
+          if (!sourceTx) continue;
+          utxos.push({ txid: u.txid, vout: u.vout, satoshis: u.satoshis, sourceTx });
         }
         pools.push(utxos);
       }
@@ -275,7 +286,8 @@ export class DirectBroadcastEngine {
 
       this.utxoPools = pools;
       const savedAgo = data.savedAt ? `${Math.round((Date.now() - data.savedAt) / 1000)}s ago` : 'unknown';
-      this.log('CHAINTIP', `Restored ${total} UTXOs across ${pools.length} streams (snapshot ${savedAgo})`);
+      const fmt = parentsMap && Object.keys(parentsMap).length > 0 ? 'v2' : 'v1';
+      this.log('CHAINTIP', `Restored ${total} UTXOs across ${pools.length} streams (${fmt} snapshot ${savedAgo}, ${txCache.size} parent txs)`);
       return true;
     } catch (err: any) {
       this.log('CHAINTIP', `Restore failed: ${err.message}`);
@@ -283,21 +295,39 @@ export class DirectBroadcastEngine {
     }
   }
 
-  /** Write utxoPools snapshot atomically. Called by timer + flush(). */
+  /**
+   * Write utxoPools snapshot atomically. Called by timer + flush().
+   *
+   * v2 FORMAT (dedupe):
+   *   {
+   *     savedAt, totalBroadcast,
+   *     parents: { "<txid>": "<hex>" },   // each parent tx serialized ONCE
+   *     streams: [{ streamId, utxos: [{ txid, vout, satoshis }] }]  // no inline hex
+   *   }
+   *
+   * Rationale: when a pre-split creates 3200 UTXOs that all share the same
+   * parent tx hex, v1's per-UTXO `sourceTxHex` wrote that 108 KB hex 3200×
+   * per flush = ~350 MB of blocking writeFileSync every 5 s, starving the
+   * event loop and freezing the broadcast engine. v2 writes the parent once
+   * in a `parents` map and UTXOs reference by txid → 3200 UTXOs + 1 parent
+   * = ~300 KB file. ~1000× smaller and non-blocking on real fleets.
+   */
   private persistChainTip(): void {
     if (!this.chainTipPath) return;
+    const parents: Record<string, string> = {};
+    const streams = this.utxoPools.map((pool, streamId) => ({
+      streamId,
+      utxos: pool.map(u => {
+        if (!parents[u.txid]) parents[u.txid] = u.sourceTx.toHex();
+        return { txid: u.txid, vout: u.vout, satoshis: u.satoshis };
+      }),
+    }));
     const data = {
       savedAt: Date.now(),
       totalBroadcast: this.totalBroadcast,
-      streams: this.utxoPools.map((pool, streamId) => ({
-        streamId,
-        utxos: pool.map(u => ({
-          txid: u.txid,
-          vout: u.vout,
-          satoshis: u.satoshis,
-          sourceTxHex: u.sourceTx.toHex(),
-        })),
-      })),
+      format: 'v2',
+      parents,
+      streams,
     };
     const tmp = this.chainTipPath + '.tmp';
     writeFileSync(tmp, JSON.stringify(data));
