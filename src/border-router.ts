@@ -1329,9 +1329,12 @@ const server = Bun.serve({
 
           const client = new Anthropic({ apiKey });
           const model = process.env.REPORT_MODEL ?? 'claude-sonnet-4-20250514';
+          // 16000 tokens ≈ 60 KB — enough to finish the conclusion at our current
+          // prompt sizes. Opus/Sonnet caps are higher, but 16k is plenty for a
+          // post-run analysis and keeps cost bounded.
           const message = await client.messages.create({
             model,
-            max_tokens: 4096,
+            max_tokens: 16000,
             messages: [{ role: 'user', content: prompt }],
           });
 
