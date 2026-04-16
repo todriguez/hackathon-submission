@@ -29,7 +29,7 @@ x-floor-base: &floor-base
   networks:
     - casino-mesh
   init: true
-  restart: ${FLOOR_RESTART:-always}
+  restart: ${FLOOR_RESTART:-"no"}
   volumes:
     - audit-logs:/audit:rw
     - ./data:/funding:ro
