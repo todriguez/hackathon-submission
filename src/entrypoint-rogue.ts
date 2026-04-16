@@ -577,6 +577,13 @@ async function playAtTable(
 async function main() {
   await initMulticast();
 
+  // Register with router so dashboard shows us
+  fetch(`${ROUTER_URL}/api/register-apex`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apexId: ROGUE_ID, model: 'rogue', provider: 'mock' }),
+  }).catch(() => {});
+
   console.log(`[${ROGUE_ID}] Waiting for floor data...`);
   await new Promise(r => setTimeout(r, 8000));
 
