@@ -284,6 +284,12 @@ function computeHeadToHead(): Record<string, { wins: number; losses: number; tot
 
 function getOrCreatePlayerStats(playerId: string, tableId?: string, persona?: string): PlayerFloorStats {
   let stats = playerStats.get(playerId);
+  if (stats) {
+    // Update tableId/persona if we now have better info
+    if (tableId && stats.tableId === 'unknown') stats.tableId = tableId;
+    if (persona && persona !== 'unknown' && stats.persona === 'unknown') stats.persona = persona;
+    return stats;
+  }
   if (!stats) {
     stats = {
       playerId,
@@ -311,12 +317,12 @@ function getOrCreatePlayerStats(playerId: string, tableId?: string, persona?: st
   return stats;
 }
 
-function updatePlayerStatsFromHand(hand: Hand, potSize: number): void {
+function updatePlayerStatsFromHand(hand: Hand, potSize: number, tableId?: string): void {
   // Track every player's actions in this hand
   const playersInHand = new Set<string>();
   for (const action of hand.actions) {
     playersInHand.add(action.botId);
-    const ps = getOrCreatePlayerStats(action.botId);
+    const ps = getOrCreatePlayerStats(action.botId, tableId);
     ps.totalActions++;
     switch (action.type) {
       case 'fold': ps.foldCount++; break;
@@ -337,14 +343,14 @@ function updatePlayerStatsFromHand(hand: Hand, potSize: number): void {
 
   // Track showdown results
   for (const sd of hand.showdown || []) {
-    const ps = getOrCreatePlayerStats(sd.botId);
+    const ps = getOrCreatePlayerStats(sd.botId, tableId);
     ps.showdownCount++;
     if (sd.won) ps.showdownWins++;
   }
 
   // Track hand participation and wins
   for (const pid of playersInHand) {
-    const ps = getOrCreatePlayerStats(pid);
+    const ps = getOrCreatePlayerStats(pid, tableId);
     ps.handsPlayed++;
     if (hand.winner === pid) {
       ps.handsWon++;
@@ -639,7 +645,7 @@ const server = Bun.serve({
           } else {
             stats.totalPotLost += h.potSize ?? 0;
           }
-          updatePlayerStatsFromHand(hand, h.potSize ?? 0);
+          updatePlayerStatsFromHand(hand, h.potSize ?? 0, h.tableId);
         }
 
         // ── Player Stats ──
@@ -712,7 +718,7 @@ const server = Bun.serve({
         } else {
           stats.totalPotLost += body.potSize ?? 0;
         }
-        updatePlayerStatsFromHand(hand, body.potSize ?? 0);
+        updatePlayerStatsFromHand(hand, body.potSize ?? 0, body.tableId);
 
         // Paskian + learning curve deferred to periodic timer
         return Response.json({ ok: true, totalHands: totalHandsIngested }, { headers: corsHeaders });
@@ -1855,7 +1861,7 @@ console.log(`[BorderRouter] AnchorIngress active — audit: ${AUDIT_LOG_DIR}/bsv
               stats.totalPotLost += potSize;
             }
           }
-          updatePlayerStatsFromHand(hand, potSize);
+          updatePlayerStatsFromHand(hand, potSize, body?.tableId);
 
           // Paskian interactions — fire-and-forget
           try {
