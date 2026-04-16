@@ -227,6 +227,11 @@ export class DirectBroadcastEngine {
         }
       }
     }, flushMs);
+    // Loud boot marker so preflight / first 5s of container logs prove the
+    // patch is actually live in this image. If you don't see this line,
+    // chain-tip persistence is NOT active and restarts will repeat the
+    // 85k-dead-broadcast disaster.
+    this.log('CHAINTIP', `persistence enabled → ${filePath} (flush every ${flushMs}ms)`);
   }
 
   /**
