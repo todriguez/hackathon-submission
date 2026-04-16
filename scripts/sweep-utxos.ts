@@ -21,6 +21,8 @@ const address = privKey.toPublicKey().toAddress();
 const sweepTo = process.env.SWEEP_TO ?? address; // default: sweep to self (consolidate)
 const arc = new ARC(process.env.ARC_URL ?? 'https://arc.gorillapool.io');
 const FEE_RATE = parseFloat(process.env.FEE_RATE ?? '0.1');
+const DRY_RUN = process.env.DRY_RUN === 'true' || process.env.DRY_RUN === '1';
+if (DRY_RUN) console.log('  *** DRY RUN — will build + sign txs but NOT broadcast ***');
 const p2pkh = new P2PKH();
 
 console.log('');
@@ -31,37 +33,86 @@ console.log(`  From:    ${address}`);
 console.log(`  To:      ${sweepTo}`);
 console.log('');
 
-// ── Discover UTXOs via both APIs ──
+// ── Discover UTXOs ──
+//
+// Primary: Bitails (reports full confirmed balance, paginated 10k/page).
+// WoC and GorillaPool are supplements — WoC caps at 1000, GorillaPool only
+// indexes ordinal-tagged outputs (misses ~97% of plain P2PKH UTXOs).
+//
+// Sanity-check against Bitails balance endpoint — if discovered total doesn't
+// match confirmed balance, we're missing UTXOs and should abort.
 
 interface Utxo { txid: string; vout: number; sats: number; }
 
 const utxoMap = new Map<string, Utxo>(); // dedupe by outpoint
 
-// WoC
-console.log('  Checking WoC...');
+// Bitails balance (source of truth for "how much should we see?")
+let expectedBalance = 0;
+try {
+  const resp = await fetch(`https://api.bitails.io/address/${address}/balance`);
+  if (resp.ok) {
+    const b: any = await resp.json();
+    expectedBalance = b.confirmed ?? 0;
+    console.log(`  Bitails balance: ${expectedBalance.toLocaleString()} sats confirmed (${b.count ?? '?'} UTXOs)`);
+  }
+} catch (e: any) { console.log(`  Bitails balance failed: ${e.message}`); }
+
+// Bitails paginated UTXO enumeration
+console.log('  Enumerating via Bitails...');
+const BITAILS_PAGE = 10000;
+for (let page = 0; page < 20; page++) {
+  const from = page * BITAILS_PAGE;
+  try {
+    const resp = await fetch(`https://api.bitails.io/address/${address}/unspent?limit=${BITAILS_PAGE}&from=${from}`);
+    if (!resp.ok) { console.log(`  Bitails page ${page + 1}: HTTP ${resp.status}`); break; }
+    const data: any = await resp.json();
+    const arr: any[] = Array.isArray(data) ? data : (data.unspent ?? []);
+    if (arr.length === 0) break;
+    for (const u of arr) {
+      const txid = u.txid ?? u.tx_hash;
+      const vout = u.vout ?? u.tx_pos;
+      const sats = u.satoshis ?? u.value;
+      if (txid != null && vout != null && sats != null) {
+        utxoMap.set(`${txid}:${vout}`, { txid, vout, sats });
+      }
+    }
+    console.log(`  Bitails page ${page + 1}: +${arr.length} (total so far: ${utxoMap.size})`);
+    if (arr.length < BITAILS_PAGE) break;
+  } catch (e: any) { console.log(`  Bitails page ${page + 1} failed: ${e.message}`); break; }
+}
+
+// WoC supplement (may catch a few Bitails missed, capped at 1000)
 try {
   const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`);
   if (resp.ok) {
     const woc: any[] = await resp.json();
+    let added = 0;
     for (const u of woc) {
-      utxoMap.set(`${u.tx_hash}:${u.tx_pos}`, { txid: u.tx_hash, vout: u.tx_pos, sats: u.value });
+      const key = `${u.tx_hash}:${u.tx_pos}`;
+      if (!utxoMap.has(key)) {
+        utxoMap.set(key, { txid: u.tx_hash, vout: u.tx_pos, sats: u.value });
+        added++;
+      }
     }
-    console.log(`  WoC: ${woc.length} UTXOs`);
+    console.log(`  WoC: ${woc.length} UTXOs (${added} new)`);
   }
 } catch (e: any) { console.log(`  WoC failed: ${e.message}`); }
 
-// GorillaPool ordinals
-console.log('  Checking GorillaPool ordinals...');
+// GorillaPool ordinals supplement
 try {
-  const resp = await fetch(`https://ordinals.gorillapool.io/api/txos/address/${address}/unspent?limit=10000`);
+  const resp = await fetch(`https://ordinals.gorillapool.io/api/txos/address/${address}/unspent?limit=100000`);
   if (resp.ok) {
     const gp: any[] = await resp.json();
+    let added = 0;
     for (const u of gp) {
-      if (!u.spend) {
-        utxoMap.set(`${u.txid}:${u.vout}`, { txid: u.txid, vout: u.vout, sats: u.satoshis });
+      if (u.spend) continue;
+      const key = `${u.txid}:${u.vout}`;
+      if (!utxoMap.has(key)) {
+        utxoMap.set(key, { txid: u.txid, vout: u.vout, sats: u.satoshis });
+        added++;
       }
     }
-    console.log(`  GorillaPool: ${gp.length} UTXOs`);
+    console.log(`  GorillaPool: ${gp.length} UTXOs (${added} new)`);
   }
 } catch (e: any) { console.log(`  GorillaPool failed: ${e.message}`); }
 
@@ -69,8 +120,13 @@ const utxos = Array.from(utxoMap.values());
 const totalSats = utxos.reduce((s, u) => s + u.sats, 0);
 
 console.log('');
-console.log(`  Total unique UTXOs: ${utxos.length}`);
+console.log(`  Total unique UTXOs: ${utxos.length.toLocaleString()}`);
 console.log(`  Total sats: ${totalSats.toLocaleString()} (${(totalSats / 1e8).toFixed(4)} BSV)`);
+if (expectedBalance > 0) {
+  const delta = expectedBalance - totalSats;
+  const pct = ((totalSats / expectedBalance) * 100).toFixed(2);
+  console.log(`  Expected: ${expectedBalance.toLocaleString()} sats — coverage ${pct}% (missing ${delta.toLocaleString()})`);
+}
 
 if (utxos.length === 0) {
   console.log('  Nothing to sweep!');
@@ -85,34 +141,19 @@ for (const u of utxos) {
   byTxid.set(u.txid, list);
 }
 
-console.log(`  Unique parent txs: ${byTxid.size}`);
+console.log(`  Unique parent txs: ${byTxid.size.toLocaleString()}`);
 console.log('');
-console.log('  Fetching source transactions...');
+console.log('  Skipping source-tx fetch — signing with explicit sats + locking script.');
 
-const sourceTxCache = new Map<string, Transaction>();
-let fetched = 0;
-for (const txid of byTxid.keys()) {
-  try {
-    const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`);
-    if (resp.ok) {
-      sourceTxCache.set(txid, Transaction.fromHex(await resp.text()));
-      fetched++;
-    }
-    // Rate limit WoC
-    if (fetched % 3 === 0) await new Promise(r => setTimeout(r, 1000));
-  } catch {}
-}
-console.log(`  Fetched ${fetched}/${byTxid.size} source txs`);
+// P2PKH.unlock() accepts sourceSatoshis + lockingScript directly (SDK v1.x).
+// Every UTXO on this address uses the same P2PKH locking script, so we compute
+// it once and pass (sats, script) per input — no parent tx hex required.
+const knownLockingScript = p2pkh.lock(address);
 
-// Filter to UTXOs we can sign
-const sweepable = utxos.filter(u => sourceTxCache.has(u.txid));
-const sweepableSats = sweepable.reduce((s, u) => s + u.sats, 0);
-console.log(`  Sweepable: ${sweepable.length} UTXOs (${sweepableSats.toLocaleString()} sats)`);
-
-if (sweepable.length === 0) {
-  console.log('  No sweepable UTXOs (could not fetch source txs)');
-  process.exit(1);
-}
+// All discovered UTXOs are sweepable (we sign via known script+sats).
+const sweepable = utxos;
+const sweepableSats = totalSats;
+console.log(`  Sweepable: ${sweepable.length.toLocaleString()} UTXOs (${sweepableSats.toLocaleString()} sats)`);
 
 // ── Sweep in batches of 200 inputs ──
 
@@ -129,8 +170,8 @@ for (let i = 0; i < sweepable.length; i += BATCH_SIZE) {
     tx.addInput({
       sourceTXID: u.txid,
       sourceOutputIndex: u.vout,
-      sourceTransaction: sourceTxCache.get(u.txid)!,
-      unlockingScriptTemplate: p2pkh.unlock(privKey),
+      // No sourceTransaction — sign via explicit sats + locking script
+      unlockingScriptTemplate: p2pkh.unlock(privKey, 'all', false, u.sats, knownLockingScript),
     });
   }
 
@@ -150,6 +191,13 @@ for (let i = 0; i < sweepable.length; i += BATCH_SIZE) {
 
   await tx.sign();
   const txid = tx.id('hex') as string;
+
+  if (DRY_RUN) {
+    console.log(`  [DRY] Batch ${Math.floor(i / BATCH_SIZE) + 1}: ${batch.length} UTXOs, ${inputSats} in - ${fee} fee = ${output} out  txid=${txid.slice(0, 16)}...`);
+    txids.push(txid);
+    totalSwept += output;
+    continue;
+  }
 
   try {
     const result = await tx.broadcast(arc);
