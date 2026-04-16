@@ -45,6 +45,11 @@ const ARC_API_KEY = process.env.ARC_API_KEY ?? '';
 const WAIT_FOR_MINE = process.env.WAIT_FOR_MINE !== '0';
 const MINE_TIMEOUT_MS = Number(process.env.MINE_TIMEOUT_MS ?? '1800000');
 const TARGET_SATS = Number(process.env.TARGET_SATS ?? '200000000'); // 2.0 BSV
+// Optional cross-WIF destination — if set, final merge (or singleton sweep) is
+// deposited at this address instead of the WIF's own address. Batch sweeps still
+// go back to self so the merge can spend them. Useful when retiring a corrupted
+// WIF and moving residual funds to a fresh key.
+const DEST_ADDRESS = process.env.DEST_ADDRESS ?? '';
 
 const FEE_RATE = 0.1; // sat/byte — matches DirectBroadcastEngine default
 const MIN_FEE = 138;
@@ -69,6 +74,9 @@ console.log('══════════════════════�
 console.log('  CONSOLIDATE — One clean mined UTXO, zero orphan chain');
 console.log('═══════════════════════════════════════════════════════════');
 console.log(`  Address: ${address}`);
+if (DEST_ADDRESS && DEST_ADDRESS !== address) {
+  console.log(`  Dest:    ${DEST_ADDRESS} (cross-WIF sweep)`);
+}
 console.log(`  ARC:     ${ARC_URL}${ARC_API_KEY ? ' (authed)' : ' (no key)'}`);
 console.log(`  Wait for mine: ${WAIT_FOR_MINE}`);
 console.log('');
@@ -352,11 +360,19 @@ async function main() {
   }
   console.log(`  ${batches.length} sweep batches (≤${BATCH_INPUTS} inputs each)`);
 
+  // If there's exactly one batch AND a cross-WIF DEST is set, the singleton
+  // sweep IS the final — send it straight to DEST. Otherwise, batch sweeps
+  // deposit back to self so the later merge tx (we own the self-WIF) can spend
+  // them; the merge then pays out to DEST (or self if unset).
+  const singletonDest = batches.length === 1 && DEST_ADDRESS && DEST_ADDRESS !== address
+    ? DEST_ADDRESS
+    : address;
+
   const sweepResults: Array<{ txid: string; tx: Transaction; sats: number }> = [];
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
     try {
-      const { tx, outSats } = await buildSweepTx(batch);
+      const { tx, outSats } = await buildSweepTx(batch, singletonDest);
       const txid = tx.id('hex') as string;
       const txHex = tx.toHex();
       const result = await broadcastArc(txHex, `sweep-${i}`);
@@ -410,7 +426,8 @@ async function main() {
     utxo: { txid: s.txid, vout: 0, sats: s.sats },
     sourceTx: s.tx,
   }));
-  const { tx: finalTx, outSats: finalSats } = await buildSweepTx(mergeInputs);
+  const mergeDest = DEST_ADDRESS && DEST_ADDRESS !== address ? DEST_ADDRESS : address;
+  const { tx: finalTx, outSats: finalSats } = await buildSweepTx(mergeInputs, mergeDest);
   const finalTxid = finalTx.id('hex') as string;
   const finalHex = finalTx.toHex();
   console.log(`  Merge: ${mergeInputs.length} inputs → ${finalSats.toLocaleString()} sats → ${finalTxid}`);
@@ -437,12 +454,13 @@ async function main() {
 async function finalizeTx(tx: Transaction, sats: number) {
   const txid = tx.id('hex') as string;
   const hex = tx.toHex();
+  const recordedAddress = DEST_ADDRESS && DEST_ADDRESS !== address ? DEST_ADDRESS : address;
   mkdirSync('data', { recursive: true });
   writeFileSync('data/funding-tx.hex', hex);
   writeFileSync(
     'data/consolidated.json',
     JSON.stringify(
-      { txid, vout: 0, sats, address, consolidatedAt: new Date().toISOString() },
+      { txid, vout: 0, sats, address: recordedAddress, consolidatedAt: new Date().toISOString() },
       null,
       2,
     ),
