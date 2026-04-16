@@ -176,9 +176,10 @@ interface TelemetryBatch {
   cells: any[];
   eliminations: any[];
   premiumHands: any[];
+  paymentChannels: any[];
 }
 
-let telemetryBatch: TelemetryBatch = { hands: [], playerStats: [], swarmEma: [], cells: [], eliminations: [], premiumHands: [] };
+let telemetryBatch: TelemetryBatch = { hands: [], playerStats: [], swarmEma: [], cells: [], eliminations: [], premiumHands: [], paymentChannels: [] };
 let telemetryFlushInFlight = false;
 
 const TELEMETRY_FLUSH_MS = 1000;
@@ -186,10 +187,10 @@ const TELEMETRY_FLUSH_MS = 1000;
 const telemetryFlushInterval = setInterval(() => {
   const batch = telemetryBatch;
   const hasData = batch.hands.length || batch.playerStats.length || batch.swarmEma.length
-    || batch.cells.length || batch.eliminations.length || batch.premiumHands.length;
+    || batch.cells.length || batch.eliminations.length || batch.premiumHands.length || batch.paymentChannels.length;
   if (!hasData || telemetryFlushInFlight) return;
 
-  telemetryBatch = { hands: [], playerStats: [], swarmEma: [], cells: [], eliminations: [], premiumHands: [] };
+  telemetryBatch = { hands: [], playerStats: [], swarmEma: [], cells: [], eliminations: [], premiumHands: [], paymentChannels: [] };
   telemetryFlushInFlight = true;
 
   fetch(`${ROUTER_URL}/api/batch-telemetry`, {
@@ -417,6 +418,17 @@ async function runTable(localTableIdx: number, globalTableIdx: number): Promise<
         reportPlayerStats(tid, seats, handNumber + 1);
       }
 
+      // Report payment channel snapshot every 50 hands
+      if ((handNumber + 1) % 50 === 0) {
+        telemetryBatch.paymentChannels.push({
+          tableId: tid,
+          summary: paymentHub.getChannelSummary(),
+          stats: paymentHub.getStats(),
+          tickProofCount: paymentHub.getAllTickProofs().length,
+          timestamp: Date.now(),
+        });
+      }
+
       if ((handNumber + 1) % 100 === 0) {
         console.log(
           `[floor:${tableId}] Hand ${handNumber + 1}/${HANDS_PER_TABLE} — ` +
@@ -557,7 +569,7 @@ async function main() {
   clearInterval(telemetryFlushInterval);
   const finalBatch = telemetryBatch;
   const hasFinal = finalBatch.hands.length || finalBatch.playerStats.length || finalBatch.swarmEma.length
-    || finalBatch.cells.length || finalBatch.eliminations.length || finalBatch.premiumHands.length;
+    || finalBatch.cells.length || finalBatch.eliminations.length || finalBatch.premiumHands.length || finalBatch.paymentChannels.length;
   if (hasFinal) {
     try {
       await fetch(`${ROUTER_URL}/api/batch-telemetry`, {

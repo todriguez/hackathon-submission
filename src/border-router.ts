@@ -625,6 +625,7 @@ const server = Bun.serve({
           cells?: any[];
           eliminations?: any[];
           premiumHands?: any[];
+          paymentChannels?: any[];
         };
 
         // ── Hands (fast: counters + bot stats only) ──
@@ -681,6 +682,33 @@ const server = Bun.serve({
         totalEliminations += (body.eliminations ?? []).length;
         for (const ph of body.premiumHands ?? []) {
           premiumHands.push(ph);
+        }
+
+        // ── Payment Channels ──
+        for (const raw of body.paymentChannels ?? []) {
+          const hubStats = raw.stats ?? {};
+          const summary = raw.summary ?? raw.channels ?? [];
+          const report: PaymentChannelReport = {
+            tableId: raw.tableId,
+            channels: summary.map((ch: any) => ({
+              channelId: ch.channelId ?? '',
+              playerId: ch.playerId ?? '',
+              state: ch.state ?? 'unknown',
+              totalBets: ch.betSats ?? ch.totalBets ?? 0,
+              totalAwards: ch.awardSats ?? ch.totalAwards ?? 0,
+              netFlow: ch.netSats ?? ch.netFlow ?? 0,
+              ticks: ch.tickCount ?? ch.ticks ?? 0,
+            })),
+            stats: {
+              totalBets: hubStats.totalSatsTransferred ?? hubStats.totalBets ?? 0,
+              totalAwards: hubStats.totalSatsAwarded ?? hubStats.totalAwards ?? 0,
+              totalTicks: hubStats.totalTicks ?? 0,
+              channelCount: hubStats.totalChannelsOpened || hubStats.totalChannelsSettled || hubStats.channelCount || 0,
+            },
+            timestamp: raw.timestamp ?? Date.now(),
+          };
+          paymentChannels.push(report);
+          broadcastWs({ type: 'payment-channels', tableId: report.tableId, stats: report.stats });
         }
 
         return Response.json({
@@ -1319,7 +1347,7 @@ const server = Bun.serve({
             totalBets: hubStats.totalSatsTransferred ?? hubStats.totalBets ?? 0,
             totalAwards: hubStats.totalSatsAwarded ?? hubStats.totalAwards ?? 0,
             totalTicks: hubStats.totalTicks ?? 0,
-            channelCount: hubStats.totalChannelsSettled ?? hubStats.channelCount ?? hubStats.totalChannelsOpened ?? 0,
+            channelCount: hubStats.totalChannelsOpened || hubStats.totalChannelsSettled || hubStats.channelCount || 0,
           },
           timestamp: raw.timestamp ?? Date.now(),
         };

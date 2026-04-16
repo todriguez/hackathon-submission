@@ -415,7 +415,7 @@ export class TablePaymentHub {
     return (tableId: string, handNumber: number, winner: any, pot: number, actions: any[]) => {
       if (!winner || pot <= 0) return;
 
-      const winnerId = winner.identity?.id ?? winner.id ?? winner.playerId;
+      const winnerId = winner.identity?.playerId ?? winner.identity?.id ?? winner.id ?? winner.playerId;
       if (!winnerId) {
         if (this.config.verbose) {
           this.log('AWARD', `⚠ Could not determine winner ID from winner object`);
@@ -438,7 +438,7 @@ export class TablePaymentHub {
     return async (tableId: string, handNumber: number, winner: any, pot: number, actions: any[]) => {
       if (!winner || pot <= 0) return;
 
-      const winnerId = winner.identity?.id ?? winner.id ?? winner.playerId;
+      const winnerId = winner.identity?.playerId ?? winner.identity?.id ?? winner.id ?? winner.playerId;
       if (!winnerId) {
         if (this.config.verbose) {
           this.log('AWARD', `⚠ Could not determine winner ID from winner object`);
