@@ -22,7 +22,9 @@ const sweepTo = process.env.SWEEP_TO ?? address; // default: sweep to self (cons
 const arc = new ARC(process.env.ARC_URL ?? 'https://arc.gorillapool.io');
 const FEE_RATE = parseFloat(process.env.FEE_RATE ?? '0.1');
 const DRY_RUN = process.env.DRY_RUN === 'true' || process.env.DRY_RUN === '1';
+const STRICT = process.env.STRICT === 'true' || process.env.STRICT === '1';
 if (DRY_RUN) console.log('  *** DRY RUN — will build + sign txs but NOT broadcast ***');
+if (STRICT) console.log('  *** STRICT — Bitails-confirmed UTXOs only (drops phantom GorillaPool/mempool) ***');
 const p2pkh = new P2PKH();
 
 console.log('');
@@ -82,39 +84,43 @@ for (let page = 0; page < 20; page++) {
 }
 
 // WoC supplement (may catch a few Bitails missed, capped at 1000)
-try {
-  const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`);
-  if (resp.ok) {
-    const woc: any[] = await resp.json();
-    let added = 0;
-    for (const u of woc) {
-      const key = `${u.tx_hash}:${u.tx_pos}`;
-      if (!utxoMap.has(key)) {
-        utxoMap.set(key, { txid: u.tx_hash, vout: u.tx_pos, sats: u.value });
-        added++;
+if (!STRICT) {
+  try {
+    const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`);
+    if (resp.ok) {
+      const woc: any[] = await resp.json();
+      let added = 0;
+      for (const u of woc) {
+        const key = `${u.tx_hash}:${u.tx_pos}`;
+        if (!utxoMap.has(key)) {
+          utxoMap.set(key, { txid: u.tx_hash, vout: u.tx_pos, sats: u.value });
+          added++;
+        }
       }
+      console.log(`  WoC: ${woc.length} UTXOs (${added} new)`);
     }
-    console.log(`  WoC: ${woc.length} UTXOs (${added} new)`);
-  }
-} catch (e: any) { console.log(`  WoC failed: ${e.message}`); }
+  } catch (e: any) { console.log(`  WoC failed: ${e.message}`); }
+}
 
 // GorillaPool ordinals supplement
-try {
-  const resp = await fetch(`https://ordinals.gorillapool.io/api/txos/address/${address}/unspent?limit=100000`);
-  if (resp.ok) {
-    const gp: any[] = await resp.json();
-    let added = 0;
-    for (const u of gp) {
-      if (u.spend) continue;
-      const key = `${u.txid}:${u.vout}`;
-      if (!utxoMap.has(key)) {
-        utxoMap.set(key, { txid: u.txid, vout: u.vout, sats: u.satoshis });
-        added++;
+if (!STRICT) {
+  try {
+    const resp = await fetch(`https://ordinals.gorillapool.io/api/txos/address/${address}/unspent?limit=100000`);
+    if (resp.ok) {
+      const gp: any[] = await resp.json();
+      let added = 0;
+      for (const u of gp) {
+        if (u.spend) continue;
+        const key = `${u.txid}:${u.vout}`;
+        if (!utxoMap.has(key)) {
+          utxoMap.set(key, { txid: u.txid, vout: u.vout, sats: u.satoshis });
+          added++;
+        }
       }
+      console.log(`  GorillaPool: ${gp.length} UTXOs (${added} new)`);
     }
-    console.log(`  GorillaPool: ${gp.length} UTXOs (${added} new)`);
-  }
-} catch (e: any) { console.log(`  GorillaPool failed: ${e.message}`); }
+  } catch (e: any) { console.log(`  GorillaPool failed: ${e.message}`); }
+}
 
 const utxos = Array.from(utxoMap.values());
 const totalSats = utxos.reduce((s, u) => s + u.sats, 0);

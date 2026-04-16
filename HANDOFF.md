@@ -11,7 +11,8 @@ This document captures the real problems we hit, what we tried, what worked, and
 
 1. **Router hot path was choked** by per-request Paskian inference + SQLite writes. Fixed by batching telemetry and moving heavy work to periodic timers. Dashboard now flows at ~1,800 tx/sec.
 2. **Audit CSV download was empty** because the router container had no access to the audit volume. One-line docker-compose fix.
-3. **On-chain broadcast is mostly phantom.** TAAL's ARC returns `ANNOUNCED_TO_NETWORK` for txs that never actually land. **Verification: 9% on-chain post-discover-switchover, ~7% across full run.** This is the biggest outstanding issue.
+3. **On-chain broadcast was mostly phantom.** TAAL's ARC returns `ANNOUNCED_TO_NETWORK` for txs that never actually land. Verification: 9% on-chain post-discover-switchover, ~7% across full run. **FIX: switched default broadcaster to GorillaPool ARC. Sweep run (162 txs) had 10/10 WoC confirmation rate.** `.env.live` updated.
+4. **Funds recovery.** 2.49 BSV scattered across 32,677 UTXOs recovered via Bitails-backed sweep — see Problem 4.
 
 ---
 
@@ -125,10 +126,39 @@ NOT-FOUND (404): 91
 **9% real on-chain rate.** TAAL is the broadcaster, TAAL itself 404s on its own announced txids. The honest numbers for the hackathon submission should reflect this, not the dashboard's counter.
 
 ### Next steps for whoever picks this up
-1. **Drop TAAL as primary.** Re-test GorillaPool ARC (it was 502 last we tried; that may have cleared). If still down, use WoC as the authoritative broadcaster — slow, but real.
-2. **Only count confirmed txs.** Poll each txid via WoC after broadcast (with backoff), and only increment the on-chain counter once WoC returns 200. The dashboard will show a much smaller but honest number.
-3. **Fee bump.** Move from 0.1 sat/byte floor to 0.5 or 1 sat/byte. TAAL's policy accepts 0.05; miners further downstream may not.
+1. **~~Drop TAAL as primary~~ — DONE.** `.env.live` now defaults to GorillaPool ARC. Proven: sweep of 162 txs via GorillaPool had 10/10 WoC confirmation rate. TAAL for this workload had 9%.
+2. **Only count confirmed txs.** Poll each txid via WoC after broadcast (with backoff), and only increment the on-chain counter once WoC returns 200. The dashboard will show a much smaller but honest number. Still open for the floor/apex engines.
+3. **Fee bump.** Move from 0.1 sat/byte floor to 1 sat/byte. Sweep proved 1 sat/byte is reliable on GorillaPool.
 4. **Consider the plan at `~/.claude/plans/dreamy-juggling-cloud.md`** for fee tuning — it's the mirror image of what we need (that plan wanted to *lower* fees for cost reasons; the evidence here says we should *raise* them for inclusion reasons).
+
+---
+
+## Problem 4 — Recovering funds after a bad run (SOLVED)
+
+### Situation
+After the partial-phantom run, 2.49 BSV was scattered across **32,677 UTXOs** at the funding address. We needed to consolidate before launching another run.
+
+### Dead ends
+- **WoC `/unspent`** caps at 1000 results with no working pagination. Missed ~99% of UTXOs.
+- **GorillaPool ordinals** only indexes outputs with ordinal/BRC-type metadata. Saw ~6,464 UTXOs (19%) and of those most were mempool phantoms.
+- **Source-tx fetch** for signing was naive: 30,633 unique parent txs × WoC rate limit = ~2.8 hours of fetching before we could even sign.
+
+### Fixes (`scripts/sweep-utxos.ts`)
+1. **Bitails as primary indexer** — `/address/:addr/unspent?limit=10000&from=N` paginates cleanly. Found all 32,677 UTXOs in 4 pages.
+2. **Bitails `/balance`** as coverage sanity check — if discovered total doesn't match confirmed balance, you're missing UTXOs.
+3. **Skip source-tx fetch entirely.** The BSV SDK's `P2PKH.unlock(priv, 'all', false, sats, lockingScript)` accepts explicit sats + script. For a wallet that's all one address, the locking script is known, and Bitails gives you the sats. Signing is now fully offline — no parent tx hex needed. Reduced sweep prep from hours to ~30 seconds.
+4. **`STRICT=1` env flag** drops non-Bitails-confirmed UTXOs (filters out phantom mempool entries GorillaPool sees but miners won't accept).
+5. **`DRY_RUN=1` env flag** to build + sign without broadcasting.
+
+### Results
+162 sweep txs broadcast via GorillaPool, **0 rejections**, **10/10 WoC confirmation** on spot check. Recovered 2.4411 BSV. ~4.8M sats fees (1 sat/byte × 162 × ~30K-byte sweep txs). ~35K sats lost to dust below fee floor.
+
+```bash
+# Usage
+set -a && source .env.live && set +a
+DRY_RUN=1 STRICT=1 FEE_RATE=1 bun run scripts/sweep-utxos.ts   # verify
+STRICT=1 FEE_RATE=1          bun run scripts/sweep-utxos.ts   # live
+```
 
 ---
 
