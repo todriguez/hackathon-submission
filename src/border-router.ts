@@ -653,12 +653,15 @@ const server = Bun.serve({
           }
         }
 
-        // ── Swarm EMA (map update only) ──
+        // ── Swarm EMA ──
         for (const ema of body.swarmEma ?? []) {
           swarmUpdatesIngested++;
+          const ts = ema.timestamp ?? Date.now();
           for (const snap of ema.snapshots ?? []) {
-            swarmEMAState.set(snap.playerId, { ...snap, tableId: ema.tableId, timestamp: ema.timestamp });
+            swarmEMAState.set(snap.playerId, { ...snap, tableId: ema.tableId, timestamp: ts });
+            swarmEMATimeline.push({ ...snap, tableId: ema.tableId, timestamp: ts });
           }
+          while (swarmEMATimeline.length > 50000) swarmEMATimeline.shift();
         }
 
         // ── Cells (count only — no SQLite in hot path) ──
@@ -914,8 +917,12 @@ const server = Bun.serve({
     // POST /api/register-apex — apex agents register themselves for matchup detection
     if (url.pathname === '/api/register-apex' && req.method === 'POST') {
       return (async () => {
-        const body = await req.json() as { apexId: string; model: string };
+        const body = await req.json() as { apexId: string; model: string; provider?: string };
         knownApexIds.add(body.apexId);
+        // Store model info in apexRebuys map (reuse existing structure)
+        const existing = apexRebuys.get(body.apexId) ?? { count: 0, costSats: 0 };
+        existing.model = body.model ?? 'unknown';
+        apexRebuys.set(body.apexId, existing);
         return Response.json({ ok: true, knownApex: [...knownApexIds] }, { headers: corsHeaders });
       })();
     }
@@ -964,9 +971,12 @@ const server = Bun.serve({
       return (async () => {
         const body = await req.json() as { tableId: string; snapshots: SwarmEMASnapshot[]; timestamp: number };
         swarmUpdatesIngested++;
+        const ts = body.timestamp ?? Date.now();
         for (const snap of body.snapshots) {
-          swarmEMAState.set(snap.playerId, { ...snap, tableId: body.tableId, timestamp: body.timestamp });
+          swarmEMAState.set(snap.playerId, { ...snap, tableId: body.tableId, timestamp: ts });
+          swarmEMATimeline.push({ ...snap, tableId: body.tableId, timestamp: ts });
         }
+        while (swarmEMATimeline.length > 50000) swarmEMATimeline.shift();
         // Paskian deferred to periodic timer
         return Response.json({ ok: true, tracked: swarmEMAState.size, updates: swarmUpdatesIngested }, { headers: corsHeaders });
       })();
@@ -1185,7 +1195,8 @@ const server = Bun.serve({
 
       return Response.json({
         meta: {
-          totalHands: hands.length,
+          totalHands: totalHandsIngested,
+          handsInBuffer: hands.length,
           totalTxCount,
           totalCellTokens: cellCount,
           totalFeeSats: totalFee,
@@ -1264,9 +1275,10 @@ const server = Bun.serve({
 
           // Save to file
           const { mkdirSync, writeFileSync } = await import('fs');
-          mkdirSync('reports', { recursive: true });
+          const reportDir = process.env.AUDIT_LOG_DIR ?? 'reports';
+          mkdirSync(reportDir, { recursive: true });
           const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-          const filename = `reports/hackathon-report-${ts}.md`;
+          const filename = `${reportDir}/hackathon-report-${ts}.md`;
           const header = `# Hackathon Post-Run Analysis Report\n> Generated: ${new Date().toISOString()}\n> Model: ${model}\n> Hands: ${data.meta.totalHands} | Txs: ${data.meta.totalTxCount} | CellTokens: ${data.meta.totalCellTokens}\n> Fee spend: ${data.meta.totalEstFeeBsv} BSV (${data.meta.totalFeeSats} sats)\n\n---\n\n`;
           writeFileSync(filename, header + text);
           console.log(`[BorderRouter] Report saved to ${filename}`);
@@ -1878,9 +1890,13 @@ console.log(`[BorderRouter] AnchorIngress active — audit: ${AUDIT_LOG_DIR}/bsv
         },
         onSwarmEMA: (body) => {
           swarmUpdatesIngested++;
+          const ts = body.timestamp ?? Date.now();
           for (const snap of body?.snapshots ?? []) {
-            swarmEMAState.set(snap.playerId, { ...snap, tableId: body.tableId, timestamp: body.timestamp ?? Date.now() });
+            swarmEMAState.set(snap.playerId, { ...snap, tableId: body.tableId, timestamp: ts });
+            swarmEMATimeline.push({ ...snap, tableId: body.tableId, timestamp: ts });
           }
+          // Cap timeline to prevent unbounded growth
+          while (swarmEMATimeline.length > 50000) swarmEMATimeline.shift();
         },
         onElimination: (body) => {
           totalEliminations++;
