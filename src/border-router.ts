@@ -92,6 +92,38 @@ const insertCell = overlayDb.prepare(`
 
 let totalCellsIngested = 0;
 
+// ── Auto-Report Trigger ──
+// Fire a hackathon report generation when we cross every N cell tokens.
+// N=50000 by default; disable with AUTO_REPORT_EVERY=0.
+const AUTO_REPORT_EVERY = Number(process.env.AUTO_REPORT_EVERY ?? '50000');
+let lastAutoReportAtCells = 0;
+let autoReportInFlight = false;
+
+function maybeTriggerAutoReport(): void {
+  if (AUTO_REPORT_EVERY <= 0 || autoReportInFlight) return;
+  const cellsSince = totalCellsIngested - lastAutoReportAtCells;
+  if (cellsSince < AUTO_REPORT_EVERY) return;
+  // Bump the checkpoint first so concurrent writers don't re-queue
+  lastAutoReportAtCells = totalCellsIngested;
+  autoReportInFlight = true;
+  console.log(`[BorderRouter] Auto-report triggered at ${totalCellsIngested.toLocaleString()} cell tokens (threshold +${AUTO_REPORT_EVERY})`);
+  fetch(`http://localhost:${process.env.METRICS_PORT ?? 9090}/api/generate-report`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  })
+    .then((r) => r.json())
+    .then((r: any) => {
+      if (r?.ok) {
+        console.log(`[BorderRouter] Auto-report saved: ${r.savedTo} (${r.tokens} tokens, model=${r.model})`);
+      } else {
+        console.log(`[BorderRouter] Auto-report error: ${r?.error ?? '(unknown)'}`);
+      }
+    })
+    .catch((err: any) => console.log(`[BorderRouter] Auto-report fetch failed: ${err.message}`))
+    .finally(() => { autoReportInFlight = false; });
+}
+
 console.log(`[BorderRouter] Shadow overlay store initialized (in-memory SQLite)`);
 
 // ── In-memory stores ──
@@ -677,6 +709,7 @@ const server = Bun.serve({
           cellsIngested += (batch.cells ?? []).length;
         }
         totalCellsIngested += cellsIngested;
+        maybeTriggerAutoReport();
 
         // ── Eliminations + Premium Hands ──
         totalEliminations += (body.eliminations ?? []).length;
@@ -1411,6 +1444,7 @@ const server = Bun.serve({
         const body = await req.json() as { cells: any[]; sourceId?: string };
         const ingested = (body.cells ?? []).length;
         totalCellsIngested += ingested;
+        maybeTriggerAutoReport();
         // SQLite inserts deferred — count only in hot path
         return Response.json({ ok: true, ingested, totalCells: totalCellsIngested }, { headers: corsHeaders });
       })();
@@ -1943,6 +1977,7 @@ console.log(`[BorderRouter] AnchorIngress active — audit: ${AUDIT_LOG_DIR}/bsv
         onCells: (body) => {
           const cells = body?.cells ?? [];
           totalCellsIngested += cells.length;
+          maybeTriggerAutoReport();
           const sourceId = body?.sourceId ?? null;
           try {
             overlayDb.run('BEGIN');

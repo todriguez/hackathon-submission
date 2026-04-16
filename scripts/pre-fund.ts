@@ -363,6 +363,36 @@ async function legacyPreFund() {
   console.log(`  ✓ Fan-out tx: ${txid}`);
   console.log(`  https://whatsonchain.com/tx/${txid}`);
 
+  // Wait for ARC to fully ingest the fan-out — critical for avoiding orphan
+  // mempool contamination on downstream pre-split children.
+  console.log('  Waiting for ARC to index fan-out (prevents orphan-mempool on children)...');
+  const arcUrl = process.env.ARC_URL ?? 'https://arc.gorillapool.io';
+  const arcKey = process.env.ARC_API_KEY ?? '';
+  const arcHeaders: Record<string, string> = arcKey ? { Authorization: `Bearer ${arcKey}` } : {};
+  const waitStart = Date.now();
+  const waitCap = 90_000;
+  let arcSaw = false;
+  while (Date.now() - waitStart < waitCap) {
+    try {
+      const r = await fetch(`${arcUrl}/v1/tx/${txid}`, { headers: arcHeaders });
+      if (r.ok) {
+        const body: any = await r.json().catch(() => ({}));
+        const status: string = body?.txStatus ?? '';
+        if (['SEEN_ON_NETWORK', 'MINED', 'ACCEPTED_BY_NETWORK', 'ANNOUNCED_TO_NETWORK', 'STORED', 'CONFIRMED'].includes(status)) {
+          console.log(`  ✓ ARC indexed fan-out (${status}) after ${Date.now() - waitStart}ms`);
+          arcSaw = true;
+          break;
+        } else if (status) {
+          console.log(`  ARC status: ${status} — waiting...`);
+        }
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (!arcSaw) {
+    console.log(`  ⚠ ARC did not index fan-out within ${waitCap}ms — children may orphan. Proceeding anyway.`);
+  }
+
   // Save tx hex to file
   mkdirSync('data', { recursive: true });
   writeFileSync('data/funding-tx.hex', txHex);

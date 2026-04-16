@@ -283,6 +283,10 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANCHOR_BATCH_WINDOW_MS: ${ANCHOR_BATCH_WINDOW_MS:-30000}
       ANCHOR_MAX_TX_PER_SEC: ${ANCHOR_MAX_TX_PER_SEC:-10}
+      ARC_URL: ${ARC_URL:-https://arc.gorillapool.io}
+      ARC_API_KEY: ${ARC_API_KEY:-}
+      AUTO_REPORT_EVERY: ${AUTO_REPORT_EVERY:-50000}
+      REPORT_MODEL: ${REPORT_MODEL:-claude-opus-4-6}
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://localhost:9090/health').then(r => process.exit(r.ok ? 0 : 1))"]
       interval: 10s

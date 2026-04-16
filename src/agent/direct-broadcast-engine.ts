@@ -411,18 +411,23 @@ export class DirectBroadcastEngine {
       }
     }
 
-    // Verify tx is visible (wait up to 10s)
+    // Verify tx is visible on WoC (propagation sanity check)
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         const check = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`);
         if (check.ok && (await check.text()).length > 100) {
-          this.log('SPLIT', `✓ Confirmed visible on-chain: ${txid}`);
+          this.log('SPLIT', `✓ WoC sees tx: ${txid}`);
           break;
         }
       } catch {}
-      this.log('SPLIT', `Waiting for tx propagation... (attempt ${attempt + 1}/5)`);
+      this.log('SPLIT', `Waiting for WoC propagation... (attempt ${attempt + 1}/5)`);
       await new Promise(r => setTimeout(r, 2000));
     }
+
+    // CRITICAL: Wait for ARC to fully ingest the fan-out before streaming
+    // children to it. If ARC doesn't know the parent, children land in
+    // SEEN_IN_ORPHAN_MEMPOOL and never get mined.
+    await this.waitForArcSeen(txid, 60_000);
 
     this.logTxid(txid, 'split', funding.satoshis, fee, txHex.length / 2);
     this.log('SPLIT', `✓ Fan-out tx: ${txid} (${splits} outputs)`);
@@ -1154,6 +1159,50 @@ export class DirectBroadcastEngine {
       this.log('WOC', `Backup broadcast failed: ${err.message}`);
       return false;
     }
+  }
+
+  /**
+   * Poll ARC until it has indexed the given txid (returns SEEN_ON_NETWORK, MINED,
+   * or similar non-error status). This is CRITICAL between parent-tx broadcast and
+   * child-tx streaming — if ARC hasn't ingested the parent, all children land in
+   * SEEN_IN_ORPHAN_MEMPOOL permanently.
+   *
+   * Returns true when ARC sees the tx, false on timeout (caller may choose to
+   * proceed anyway with downgraded guarantees).
+   */
+  private async waitForArcSeen(txid: string, timeoutMs: number = 60_000): Promise<boolean> {
+    const start = Date.now();
+    const arcUrl = this.config.arcUrl;
+    const headers: Record<string, string> = {};
+    if (this.config.arcApiKey) headers['Authorization'] = `Bearer ${this.config.arcApiKey}`;
+
+    let attempt = 0;
+    while (Date.now() - start < timeoutMs) {
+      attempt++;
+      try {
+        const resp = await fetch(`${arcUrl}/v1/tx/${txid}`, { headers });
+        if (resp.ok) {
+          const body: any = await resp.json().catch(() => ({}));
+          const status = body?.txStatus || '';
+          // Any of these statuses means ARC has the tx in its own mempool/view.
+          // STORED means it was accepted but not yet validated - treat as good enough.
+          // ORPHAN is the failure mode we're trying to avoid downstream.
+          const goodStatuses = [
+            'SEEN_ON_NETWORK', 'MINED', 'ACCEPTED_BY_NETWORK',
+            'ANNOUNCED_TO_NETWORK', 'SEEN_IN_ORPHAN_MEMPOOL',
+            'STORED', 'CONFIRMED',
+          ];
+          if (goodStatuses.includes(status)) {
+            this.log('ARC-WAIT', `✓ ARC sees ${txid.slice(0, 16)}... (${status}) after ${attempt} polls / ${Date.now() - start}ms`);
+            return true;
+          }
+          this.log('ARC-WAIT', `ARC status=${status || '(none)'} — polling again`);
+        }
+      } catch {}
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    this.log('ARC-WAIT', `⚠ ARC did not index ${txid.slice(0, 16)}... within ${timeoutMs}ms — children may orphan`);
+    return false;
   }
 
   private log(label: string, msg: string): void {
