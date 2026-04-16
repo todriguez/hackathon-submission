@@ -241,9 +241,24 @@ function connectWS() {
 }
 connectWS();
 
+// WS pushes batch summaries every 2s — render inline without re-fetching.
+// The 5s setInterval handles full refreshes. DO NOT call refresh() from here.
 function handleWSEvent(msg) {
-  // Refresh on any event
-  refresh();
+  if (msg.type === 'batch' || msg.type === 'snapshot') {
+    // Inline render from the WS push — fast path, no HTTP
+    renderStats({
+      totalHands: msg.totalHands,
+      totalTxCount: msg.totalTx ?? msg.totalTx,
+      totalEliminations: msg.totalEliminations ?? 0,
+      totalUniquePlayers: msg.activeBots ?? 0,
+      uptimeMs: _lastUptime, // keep previous uptime; full refresh updates it
+    });
+    // Update CellTokens count from WS if available
+    if (msg.totalCells != null) {
+      document.getElementById('s-cells').textContent = fmt(msg.totalCells);
+    }
+  }
+  // NO refresh() call — this was the #1 crash cause
 }
 
 // ── Helpers ──
@@ -262,21 +277,35 @@ function txLink(txid) {
   return `<a class="txid" href="https://whatsonchain.com/tx/${txid}" target="_blank">${txid.slice(0,16)}...</a>`;
 }
 
-// ── Data fetchers ──
+// ── Data fetchers with per-cycle dedup ──
+const _fetchCache = new Map();  // path → {promise, ts}
+const CACHE_TTL = 2000;         // ms — one cycle
+
 async function fetchJSON(path) {
-  try { const r = await fetch(BASE + path); return r.ok ? await r.json() : null; } catch { return null; }
+  const now = Date.now();
+  const cached = _fetchCache.get(path);
+  if (cached && now - cached.ts < CACHE_TTL) return cached.promise;
+  const promise = fetch(BASE + path).then(r => r.ok ? r.json() : null).catch(() => null);
+  _fetchCache.set(path, { promise, ts: now });
+  return promise;
 }
 
 let _lastUptime = 0;
-async function refreshStats() {
-  const d = await fetchJSON('/api/stats');
+
+// Render stats from any source (WS push or fetch)
+function renderStats(d) {
   if (!d) return;
   document.getElementById('s-hands').textContent = fmt(d.totalHands);
-  document.getElementById('s-txs').textContent = fmt(d.totalTxCount); // kernel validations (internal)
+  document.getElementById('s-txs').textContent = fmt(d.totalTxCount);
   document.getElementById('s-elim').textContent = fmt(d.totalEliminations);
   document.getElementById('s-players').textContent = fmt(d.totalUniquePlayers);
   _lastUptime = d.uptimeMs || (Date.now() - d.startTime);
   document.getElementById('s-uptime').textContent = fmtTime(_lastUptime);
+}
+
+async function refreshStats() {
+  const d = await fetchJSON('/api/stats');
+  renderStats(d);
   document.getElementById('s-hps').textContent = (d.totalHands / ((_lastUptime || 1) / 1000)).toFixed(1);
 }
 
@@ -342,12 +371,13 @@ async function refreshPolicies() {
   const d = await fetchJSON('/api/policy-summary');
   if (!d) return;
   const el = document.getElementById('policies');
-  if (!d.bots?.length) return;
-  el.innerHTML = d.bots.map(b =>
+  const agents = d.agents ?? d.bots ?? [];
+  if (!agents.length) return;
+  el.innerHTML = agents.map(b =>
     `<div style="margin-bottom:12px">` +
-    `<div class="stat"><span class="label">${b.botId}</span><span class="value purple">v${b.latestVersion}</span></div>` +
-    `<div class="stat"><span class="label">Upgrades</span><span class="value">${b.totalVersions}</span></div>` +
-    (b.latestLisp ? `<code class="policy-lisp">${b.latestLisp.slice(0, 200)}</code>` : '') +
+    `<div class="stat"><span class="label">${b.botId}</span><span class="value purple">v${b.totalVersions ?? b.latestVersion ?? 0}</span></div>` +
+    `<div class="stat"><span class="label">Strategy</span><span class="value">${b.currentStrategy ?? 'unknown'}</span></div>` +
+    (b.currentLisp ? `<code class="policy-lisp">${b.currentLisp.slice(0, 200)}</code>` : '') +
     `</div>`
   ).join('');
 }
@@ -732,31 +762,41 @@ async function refreshTPSGauge() {
   }).join('');
 }
 
-// ── Refresh loop ──
+// ── Refresh loop (guarded against overlapping runs) ──
+let _refreshing = false;
 async function refresh() {
-  await Promise.all([
-    refreshStats(),
-    refreshCellStats(),
-    refreshMesh(),
-    refreshCheats(),
-    refreshPremium(),
-    refreshMatchups(),
-    refreshPolicies(),
-    refreshSettlements(),
-    refreshTxDag(),
-    refreshTables(),
-    refreshApex(),
-    refreshSwarmEMA(),
-    refreshPaskian(),
-    refreshExportStats(),
-    refreshPaymentChannels(),
-    refreshEMAPaskian(),
-    refreshTPSGauge(),
-  ]);
+  if (_refreshing) return;  // drop if previous cycle still in-flight
+  _refreshing = true;
+  try {
+    // Phase 1: lightweight stats (fast endpoints)
+    await Promise.all([
+      refreshStats(),
+      refreshCellStats(),
+      refreshTPSGauge(),
+      refreshMesh(),
+    ]);
+    // Phase 2: heavier endpoints (tables, agents, overlays)
+    await Promise.all([
+      refreshCheats(),
+      refreshPremium(),
+      refreshMatchups(),
+      refreshPolicies(),
+      refreshSettlements(),
+      refreshTxDag(),
+      refreshTables(),
+      refreshApex(),
+      refreshSwarmEMA(),
+      refreshPaskian(),
+      refreshExportStats(),
+      refreshPaymentChannels(),
+      refreshEMAPaskian(),
+    ]);
+  } catch (e) { console.warn('refresh error:', e); }
+  _refreshing = false;
 }
 
 refresh();
-setInterval(refresh, 2000);
+setInterval(refresh, 5000);  // was 2000 — 17 endpoints × 2s = browser OOM
 </script>
 </body>
 </html>
