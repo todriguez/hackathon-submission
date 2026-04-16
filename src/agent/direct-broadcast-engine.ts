@@ -37,7 +37,7 @@ import { CellStore } from '../protocol/cell-store';
 import { MemoryAdapter } from '../protocol/adapters/memory-adapter';
 import { Linearity } from '../protocol/constants';
 import { createHash } from 'crypto';
-import { appendFileSync, writeFileSync, existsSync } from 'fs';
+import { appendFileSync, writeFileSync, existsSync, readFileSync, renameSync } from 'fs';
 
 // ── Types ──
 
@@ -133,6 +133,19 @@ export class DirectBroadcastEngine {
   private pendingBroadcasts: Promise<void>[] = [];
   /** Append-only CSV audit log path (null = no logging) */
   private auditLogPath: string | null = null;
+  /**
+   * Chain-tip persistence:
+   *   After each successful broadcast, the change output becomes the next parent
+   *   for its stream. If the container restarts without persisting this state,
+   *   the next boot re-ingests the original funding UTXO and double-spends it,
+   *   causing every subsequent tx to be rejected as "Missing inputs".
+   *
+   *   This path points to a JSON snapshot of utxoPools. A timer persists every
+   *   `chainTipFlushMs` (default 5s) and `flush()` persists on shutdown.
+   */
+  private chainTipPath: string | null = null;
+  private chainTipTimer: ReturnType<typeof setInterval> | null = null;
+  private chainTipDirty: boolean = false;
   /** Batch queue for burst broadcasting */
   private batchQueue: Transaction[] = [];
   private batchFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -193,6 +206,115 @@ export class DirectBroadcastEngine {
     if (!this.auditLogPath) return;
     const row = `${txid},${type},${satsIn},${fee},${estBytes},${Date.now()}\n`;
     try { appendFileSync(this.auditLogPath, row); } catch {}
+  }
+
+  // ── Chain-Tip Persistence ──
+
+  /**
+   * Enable chain-tip persistence. Must be called BEFORE `restoreChainTip()`
+   * and BEFORE any broadcast. Writes the utxoPools snapshot to `filePath`
+   * every `flushMs` milliseconds (default 5000), and also on `flush()`.
+   *
+   * The file is atomic-rename-safe: we write to `${filePath}.tmp` and rename.
+   */
+  enableChainTipPersistence(filePath: string, flushMs: number = 5000): void {
+    this.chainTipPath = filePath;
+    if (this.chainTipTimer) clearInterval(this.chainTipTimer);
+    this.chainTipTimer = setInterval(() => {
+      if (this.chainTipDirty) {
+        try { this.persistChainTip(); } catch (err: any) {
+          this.log('CHAINTIP', `Persist failed: ${err.message}`);
+        }
+      }
+    }, flushMs);
+  }
+
+  /**
+   * Attempt to restore utxoPools from the persisted chain-tip snapshot.
+   * Call after `enableChainTipPersistence()`. Returns true if at least one
+   * stream was restored with at least one UTXO. False if no file, empty
+   * file, or parse failure — caller should fall through to normal funding.
+   */
+  async restoreChainTip(): Promise<boolean> {
+    if (!this.chainTipPath || !existsSync(this.chainTipPath)) return false;
+    try {
+      const raw = readFileSync(this.chainTipPath, 'utf-8');
+      const data = JSON.parse(raw);
+      if (!data || !Array.isArray(data.streams)) return false;
+
+      const pools: FundingUtxo[][] = [];
+      for (const stream of data.streams) {
+        const utxos: FundingUtxo[] = [];
+        for (const u of (stream.utxos ?? [])) {
+          if (typeof u.txid !== 'string' || typeof u.vout !== 'number' ||
+              typeof u.satoshis !== 'number' || typeof u.sourceTxHex !== 'string') continue;
+          try {
+            utxos.push({
+              txid: u.txid,
+              vout: u.vout,
+              satoshis: u.satoshis,
+              sourceTx: Transaction.fromHex(u.sourceTxHex),
+            });
+          } catch {
+            // Skip corrupt entry but keep others.
+          }
+        }
+        pools.push(utxos);
+      }
+
+      const total = pools.reduce((s, p) => s + p.length, 0);
+      if (total === 0) {
+        this.log('CHAINTIP', `Restore: no valid UTXOs in ${this.chainTipPath}`);
+        return false;
+      }
+
+      this.utxoPools = pools;
+      const savedAgo = data.savedAt ? `${Math.round((Date.now() - data.savedAt) / 1000)}s ago` : 'unknown';
+      this.log('CHAINTIP', `Restored ${total} UTXOs across ${pools.length} streams (snapshot ${savedAgo})`);
+      return true;
+    } catch (err: any) {
+      this.log('CHAINTIP', `Restore failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /** Write utxoPools snapshot atomically. Called by timer + flush(). */
+  private persistChainTip(): void {
+    if (!this.chainTipPath) return;
+    const data = {
+      savedAt: Date.now(),
+      totalBroadcast: this.totalBroadcast,
+      streams: this.utxoPools.map((pool, streamId) => ({
+        streamId,
+        utxos: pool.map(u => ({
+          txid: u.txid,
+          vout: u.vout,
+          satoshis: u.satoshis,
+          sourceTxHex: u.sourceTx.toHex(),
+        })),
+      })),
+    };
+    const tmp = this.chainTipPath + '.tmp';
+    writeFileSync(tmp, JSON.stringify(data));
+    renameSync(tmp, this.chainTipPath);
+    this.chainTipDirty = false;
+  }
+
+  /**
+   * Stop the background chain-tip timer and force a final snapshot to disk.
+   * Called by the async `flush()` on shutdown, or can be invoked directly.
+   * Safe to call if persistence was never enabled.
+   */
+  private finalizeChainTipPersistence(): void {
+    if (this.chainTipTimer) {
+      clearInterval(this.chainTipTimer);
+      this.chainTipTimer = null;
+    }
+    if (this.chainTipPath) {
+      try { this.persistChainTip(); } catch (err: any) {
+        this.log('CHAINTIP', `Final flush failed: ${err.message}`);
+      }
+    }
   }
 
   // ── Public API ──
@@ -444,6 +566,7 @@ export class DirectBroadcastEngine {
         sourceTx: tx,
       });
     }
+    this.chainTipDirty = true;
 
     this.log('SPLIT', `Partitioned: ${this.utxoPools.map((p, i) => `stream${i}=${p.length}`).join(', ')}`);
 
@@ -524,6 +647,7 @@ export class DirectBroadcastEngine {
     for (let i = 0; i < fundingUtxos.length; i++) {
       this.utxoPools[i % this.config.streams].push(fundingUtxos[i]);
     }
+    this.chainTipDirty = true;
 
     this.log('DISCOVER', `Partitioned ${fundingUtxos.length} UTXOs: ${this.utxoPools.map((p, i) => `stream${i}=${p.length}`).join(', ')}`);
     return { count: fundingUtxos.length, totalSats };
@@ -601,6 +725,7 @@ export class DirectBroadcastEngine {
         satoshis: change,
         sourceTx: tx,
       });
+      this.chainTipDirty = true;
     }
 
     this.totalBuildMs += buildMs;
@@ -733,6 +858,7 @@ export class DirectBroadcastEngine {
         satoshis: change,
         sourceTx: tx,
       });
+      this.chainTipDirty = true;
     }
 
     this.totalBuildMs += buildMs;
@@ -807,6 +933,7 @@ export class DirectBroadcastEngine {
         satoshis: change,
         sourceTx: tx,
       });
+      this.chainTipDirty = true;
     }
 
     this.totalBuildMs += buildMs;
@@ -986,6 +1113,9 @@ export class DirectBroadcastEngine {
     const errors = results.filter(r => r.status === 'rejected').length;
     const settled = results.length;
     this.pendingBroadcasts = [];
+    // After all broadcasts settle, snapshot the chain tip so the next boot
+    // restores from a known-good state.
+    this.finalizeChainTipPersistence();
     return { settled, errors };
   }
 
@@ -1125,9 +1255,11 @@ export class DirectBroadcastEngine {
     while (pool.length > 0) {
       const utxo = pool.shift()!;
       if (utxo.satoshis >= MIN_USEFUL_SATS) {
+        this.chainTipDirty = true;
         return utxo;
       }
-      // Dust UTXO — discard silently
+      // Dust UTXO — discard silently (still dirties state so we don't persist stale dust)
+      this.chainTipDirty = true;
     }
     throw new Error(`Stream ${streamId} has no more funding UTXOs for ${op}`);
   }

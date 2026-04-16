@@ -170,6 +170,9 @@ async function initBroadcastEngine(): Promise<void> {
   const logDir = process.env.AUDIT_LOG_DIR ?? '/tmp';
   broadcastEngine.enableAuditLog(`${logDir}/txids-apex-${APEX_INDEX}.csv`);
 
+  // Chain-tip persistence — restart-safe. See entrypoint-floor.ts for rationale.
+  broadcastEngine.enableChainTipPersistence(`${logDir}/chaintip-apex-${APEX_INDEX}.json`);
+
   const addr = broadcastEngine.getFundingAddress();
   const { readFileSync, existsSync } = await import('fs');
   const fundingTxHex = process.env.FUNDING_TX_HEX
@@ -183,7 +186,11 @@ async function initBroadcastEngine(): Promise<void> {
   console.log(`[${APEX_ID}] Broadcast engine address: ${addr}`);
   if (changeAddr) console.log(`[${APEX_ID}] Change sweep to: ${changeAddr}`);
 
-  if (fundingTxHex) {
+  // Prefer restart-safe chaintip snapshot over re-ingesting the fan-out vout.
+  const restored = await broadcastEngine.restoreChainTip();
+  if (restored) {
+    console.log(`[${APEX_ID}] Restored from chaintip snapshot — skipping preSplit`);
+  } else if (fundingTxHex) {
     // Pre-funded by pre-fund.ts — ingest our assigned UTXO directly
     console.log(`[${APEX_ID}] Ingesting pre-funded UTXO (vout ${fundingVout})...`);
     const funding = await broadcastEngine.ingestFunding(fundingTxHex, fundingVout);

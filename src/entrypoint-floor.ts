@@ -105,6 +105,11 @@ async function initBroadcastEngine(): Promise<void> {
   const logDir = process.env.AUDIT_LOG_DIR ?? '/tmp';
   broadcastEngine.enableAuditLog(`${logDir}/txids-floor-${BOT_INDEX}.csv`);
 
+  // Chain-tip persistence: survives container restart. Without this, the engine
+  // re-ingests FUNDING_TX_HEX on every boot and double-spends its fan-out vout,
+  // causing "Missing inputs" on every subsequent broadcast.
+  broadcastEngine.enableChainTipPersistence(`${logDir}/chaintip-floor-${BOT_INDEX}.json`);
+
   const addr = broadcastEngine.getFundingAddress();
   console.log(`[casino-floor-${BOT_INDEX}] ═══ LIVE MODE ═══`);
   console.log(`[casino-floor-${BOT_INDEX}] Funding address: ${addr}`);
@@ -112,11 +117,17 @@ async function initBroadcastEngine(): Promise<void> {
     console.log(`[casino-floor-${BOT_INDEX}] Change sweep to: ${CHANGE_ADDRESS}`);
   }
 
-  // Strategy: use dedicated fan-out UTXO first (isolated per container).
-  // Only fall back to on-chain discovery if no funding tx provided.
-  let funded = false;
+  // Priority order:
+  //   1. Chain-tip snapshot from prior run (restart-safe)
+  //   2. Fresh FUNDING_TX_HEX + preSplit (first boot)
+  //   3. On-chain discovery (fallback)
+  //   4. Wait for funding (legacy)
+  let funded = await broadcastEngine.restoreChainTip();
+  if (funded) {
+    console.log(`[casino-floor-${BOT_INDEX}] Restored from chaintip snapshot — skipping preSplit`);
+  }
 
-  if (FUNDING_TX_HEX) {
+  if (!funded && FUNDING_TX_HEX) {
     try {
       const funding = await broadcastEngine.ingestFunding(FUNDING_TX_HEX, FUNDING_VOUT);
       await broadcastEngine.preSplit(funding);
