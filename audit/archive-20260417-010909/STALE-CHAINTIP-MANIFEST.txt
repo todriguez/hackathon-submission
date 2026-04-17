@@ -1,0 +1,15 @@
+# Stale chaintip files from previous disaster run, archived before v2 patch relaunch
+# Archived at: 2026-04-16T15:09:09Z
+
+-rw-r--r--  1 toddprice  staff    5541655 Apr 16 23:17 /Users/toddprice/projects/hackathon-submission/audit/chaintip-apex-0.json
+-rw-r--r--  1 toddprice  staff    5541655 Apr 16 23:03 /Users/toddprice/projects/hackathon-submission/audit/chaintip-apex-1.json
+-rw-r--r--  1 toddprice  staff     628494 Apr 17 01:08 /Users/toddprice/projects/hackathon-submission/audit/chaintip-apex-2.json
+-rw-r--r--  1 toddprice  staff     628484 Apr 17 01:08 /Users/toddprice/projects/hackathon-submission/audit/chaintip-apex-3.json
+-rw-r--r--  1 toddprice  staff    9218473 Apr 17 01:07 /Users/toddprice/projects/hackathon-submission/audit/chaintip-floor-0.json
+-rw-r--r--  1 toddprice  staff    9053144 Apr 17 00:15 /Users/toddprice/projects/hackathon-submission/audit/chaintip-floor-1.json
+-rw-r--r--  1 toddprice  staff    9220632 Apr 17 01:08 /Users/toddprice/projects/hackathon-submission/audit/chaintip-floor-2.json
+-rw-r--r--  1 toddprice  staff      87704 Apr 17 01:07 /Users/toddprice/projects/hackathon-submission/audit/chaintip-floor-3.json
+-rw-r--r--  1 toddprice  staff    9046739 Apr 16 23:08 /Users/toddprice/projects/hackathon-submission/audit/chaintip-floor-4.json
+-rw-r--r--  1 toddprice  staff     132159 Apr 17 01:07 /Users/toddprice/projects/hackathon-submission/audit/chaintip-floor-5.json
+-rw-r--r--  1 toddprice  staff    9227099 Apr 17 01:07 /Users/toddprice/projects/hackathon-submission/audit/chaintip-floor-6.json
+-rw-r--r--  1 toddprice  staff  694497345 Apr 16 22:48 /Users/toddprice/projects/hackathon-submission/audit/chaintip-floor-7.json

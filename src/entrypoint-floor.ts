@@ -110,6 +110,11 @@ async function initBroadcastEngine(): Promise<void> {
   // causing "Missing inputs" on every subsequent broadcast.
   broadcastEngine.enableChainTipPersistence(`${logDir}/chaintip-floor-${BOT_INDEX}.json`);
 
+  // BEEF store: BRC-62 binary envelopes — every tx carries its ancestry.
+  // Replaces JSON chaintip with proper BEEF persistence that supports
+  // structural validation and SPV verification.
+  broadcastEngine.enableBeefStore(`${logDir}/chain-floor-${BOT_INDEX}.beef`);
+
   const addr = broadcastEngine.getFundingAddress();
   console.log(`[casino-floor-${BOT_INDEX}] ═══ LIVE MODE ═══`);
   console.log(`[casino-floor-${BOT_INDEX}] Funding address: ${addr}`);
@@ -118,13 +123,21 @@ async function initBroadcastEngine(): Promise<void> {
   }
 
   // Priority order:
-  //   1. Chain-tip snapshot from prior run (restart-safe)
-  //   2. Fresh FUNDING_TX_HEX + preSplit (first boot)
-  //   3. On-chain discovery (fallback)
-  //   4. Wait for funding (legacy)
-  let funded = await broadcastEngine.restoreChainTip();
+  //   1. BEEF store from prior run (restart-safe, structurally validated)
+  //   2. JSON chain-tip snapshot from prior run (legacy fallback)
+  //   3. Fresh FUNDING_TX_HEX + preSplit (first boot)
+  //   4. On-chain discovery (fallback)
+  //   5. Wait for funding (legacy)
+  let funded = await broadcastEngine.restoreFromBeef();
   if (funded) {
-    console.log(`[casino-floor-${BOT_INDEX}] Restored from chaintip snapshot — skipping preSplit`);
+    console.log(`[casino-floor-${BOT_INDEX}] Restored from BEEF store — skipping preSplit`);
+  }
+
+  if (!funded) {
+    funded = await broadcastEngine.restoreChainTip();
+    if (funded) {
+      console.log(`[casino-floor-${BOT_INDEX}] Restored from JSON chaintip snapshot — skipping preSplit`);
+    }
   }
 
   if (!funded && FUNDING_TX_HEX) {
@@ -141,7 +154,8 @@ async function initBroadcastEngine(): Promise<void> {
   if (!funded) {
     const TOTAL_FLOOR_NODES = 8;
     try {
-      const discovered = await broadcastEngine.discoverUtxos(BOT_INDEX, TOTAL_FLOOR_NODES);
+      // Each container has its own BRC-42 derived address — no partitioning needed
+      const discovered = await broadcastEngine.discoverUtxos();
       if (discovered.count >= TABLES_PER_NODE) {
         console.log(`[casino-floor-${BOT_INDEX}] Using ${discovered.count} discovered UTXOs (${discovered.totalSats.toLocaleString()} sats)`);
         funded = true;

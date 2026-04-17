@@ -38,6 +38,7 @@ import { MemoryAdapter } from '../protocol/adapters/memory-adapter';
 import { Linearity } from '../protocol/constants';
 import { createHash } from 'crypto';
 import { appendFileSync, writeFileSync, existsSync, readFileSync, renameSync } from 'fs';
+import { BeefStore } from './beef-store';
 
 // ── Types ──
 
@@ -151,6 +152,9 @@ export class DirectBroadcastEngine {
   private batchFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly BATCH_SIZE = 20;       // txs per batch POST
   private readonly BATCH_FLUSH_MS = 100;  // max wait before flushing partial batch
+  /** BEEF envelope store — when enabled, every broadcast is wrapped in a BEEF
+   *  and persistence uses BRC-62 binary instead of JSON chaintip snapshots. */
+  private beefStore: BeefStore | null = null;
 
   constructor(config?: DirectBroadcastConfig & {
     /** Optional: derive keypair from seed instead of random. All engines with same seed share the same address. */
@@ -352,6 +356,91 @@ export class DirectBroadcastEngine {
     }
   }
 
+  // ── BEEF Store ──
+
+  /**
+   * Enable BEEF envelope persistence. When active:
+   *   - Every broadcast merges the signed tx into a BEEF envelope
+   *   - Persistence writes BRC-62 binary instead of JSON chaintip
+   *   - Restore extracts UTXOs from the BEEF with structural validation
+   *   - Optional SPV verification when ChainTracker is provided
+   *
+   * Call BEFORE restoreChainTip() and preSplit(). Can coexist with
+   * JSON chaintip (BEEF takes priority on restore).
+   */
+  enableBeefStore(filePath: string, flushIntervalMs: number = 5000): void {
+    this.beefStore = new BeefStore({
+      filePath,
+      flushIntervalMs,
+      log: (tag, msg) => this.log(tag, msg),
+    });
+    this.log('BEEF', `BEEF store enabled → ${filePath}`);
+  }
+
+  /**
+   * Restore UTXO pools from the BEEF store.
+   * Returns true if restored with at least one UTXO.
+   * Falls back to JSON chaintip restore if BEEF restore fails.
+   */
+  async restoreFromBeef(): Promise<boolean> {
+    if (!this.beefStore) return false;
+
+    if (!this.beefStore.restore()) return false;
+
+    // Walk the BEEF to find all spendable tip UTXOs.
+    // A tip UTXO is one whose txid:vout is NOT spent by any other tx in the BEEF.
+    const beef = this.beefStore.getBeef();
+    const spentSet = new Set<string>(); // "txid:vout" keys that are consumed as inputs
+
+    // First pass: collect all spent outpoints
+    for (const beefTx of beef.txs) {
+      if (!beefTx.tx) continue;
+      for (const input of beefTx.tx.inputs) {
+        if (input.sourceTXID) {
+          spentSet.add(`${input.sourceTXID}:${input.sourceOutputIndex}`);
+        }
+      }
+    }
+
+    // Second pass: collect unspent outputs (tips of the UTXO chain)
+    const allUtxos: FundingUtxo[] = [];
+    for (const beefTx of beef.txs) {
+      if (!beefTx.tx) continue;
+      const txid = beefTx.tx.id('hex') as string;
+      const sourceTx = this.beefStore.getTransactionForSigning(txid);
+      if (!sourceTx) continue;
+
+      for (let vout = 0; vout < beefTx.tx.outputs.length; vout++) {
+        const key = `${txid}:${vout}`;
+        if (!spentSet.has(key)) {
+          const sats = Number(beefTx.tx.outputs[vout].satoshis);
+          if (sats > 0) { // skip OP_RETURN outputs (0 sats)
+            allUtxos.push({ txid, vout, satoshis: sats, sourceTx });
+          }
+        }
+      }
+    }
+
+    if (allUtxos.length === 0) {
+      this.log('BEEF', 'BEEF restored but no unspent UTXOs found');
+      return false;
+    }
+
+    // Partition across streams
+    this.utxoPools = Array.from({ length: this.config.streams }, () => []);
+    for (let i = 0; i < allUtxos.length; i++) {
+      this.utxoPools[i % this.config.streams].push(allUtxos[i]);
+    }
+
+    this.log('BEEF', `Restored ${allUtxos.length} tip UTXOs from BEEF across ${this.config.streams} streams`);
+    return true;
+  }
+
+  /** Get the BEEF store (for external access / stats). */
+  getBeefStore(): BeefStore | null {
+    return this.beefStore;
+  }
+
   // ── Public API ──
 
   /** Get the funding address (P2PKH) for the engine's keypair */
@@ -487,12 +576,20 @@ export class DirectBroadcastEngine {
     const tx = new Transaction();
 
     // Input: the funding UTXO
-    tx.addInput({
-      sourceTXID: funding.txid,
-      sourceOutputIndex: funding.vout,
-      sourceTransaction: funding.sourceTx,
-      unlockingScriptTemplate: p2pkh.unlock(this.privateKey),
-    });
+    if (funding.sourceTx) {
+      tx.addInput({
+        sourceTXID: funding.txid,
+        sourceOutputIndex: funding.vout,
+        sourceTransaction: funding.sourceTx,
+        unlockingScriptTemplate: p2pkh.unlock(this.privateKey),
+      });
+    } else {
+      tx.addInput({
+        sourceTXID: funding.txid,
+        sourceOutputIndex: funding.vout,
+        unlockingScriptTemplate: p2pkh.unlock(this.privateKey, 'all', false, funding.satoshis, lockingScript),
+      });
+    }
 
     // Outputs: N × splitSatoshis
     for (let i = 0; i < splits; i++) {
@@ -518,40 +615,78 @@ export class DirectBroadcastEngine {
     const txHex = tx.toHex();
     this.log('SPLIT', `Tx size: ${txHex.length / 2} bytes, actual fee: ${funding.satoshis - totalOut - (change > 546 ? change : 0)} sats`);
 
-    let arcOk = false;
-    try {
-      const result = await tx.broadcast(this.arc);
-      if ('status' in result && result.status === 'error') {
-        const fail = result as any;
-        // ARC returns status:'error' for SEEN_ON_NETWORK / ALREADY_MINED — these mean
-        // the tx IS on the network, so treat them as success (code 465 / 469 or desc match).
-        const desc = (fail.description || '').toLowerCase();
-        if (desc.includes('seen on network') || desc.includes('already mined') || desc.includes('already known')) {
-          this.log('SPLIT', `ARC reports tx already on network (code=${fail.code}) — treating as success`);
-          arcOk = true;
-        } else {
-          this.log('SPLIT', `ARC error (will retry via WoC): code=${fail.code} desc=${fail.description}`);
-        }
-      } else {
-        arcOk = true;
-      }
-    } catch (arcErr: any) {
-      this.log('SPLIT', `ARC broadcast exception (will retry via WoC): ${arcErr.message}`);
-    }
-
     const txid = tx.id('hex') as string;
+    const useMapi = process.env.BROADCAST_VIA === 'mapi' || !!process.env.MAPI_URL;
 
-    // WoC backup only when ARC failed — saves rate-limit budget during
-    // multi-container startup where all 13 containers hit WoC simultaneously.
-    let wocOk = false;
-    if (!arcOk) {
-      wocOk = await this.wocBroadcast(txHex);
-      this.log('SPLIT', `WoC broadcast: ${wocOk ? 'OK' : 'FAILED'}`);
+    let broadcastOk = false;
+
+    // Try MAPI first when configured — direct to miner mempool, 100% on-chain rate
+    if (useMapi) {
+      const mapiUrl = process.env.MAPI_URL ?? 'https://mapi.gorillapool.io/mapi/tx';
+      for (let attempt = 0; attempt < 3 && !broadcastOk; attempt++) {
+        try {
+          const resp = await fetch(mapiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rawtx: txHex }),
+          });
+          if (resp.status === 429) {
+            this.log('SPLIT', `MAPI 429, retrying (${attempt + 1}/3)...`);
+            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+            continue;
+          }
+          const raw = await resp.text();
+          try {
+            const outer = JSON.parse(raw);
+            const inner = JSON.parse(outer.payload);
+            broadcastOk = inner.returnResult === 'success'
+              || (inner.resultDescription || '').includes('already known');
+            if (broadcastOk) {
+              this.log('SPLIT', `✓ MAPI accepted pre-split: ${txid.slice(0, 16)}...`);
+            } else {
+              this.log('SPLIT', `MAPI rejected: ${inner.resultDescription}`);
+            }
+          } catch {
+            broadcastOk = resp.ok;
+            if (broadcastOk) this.log('SPLIT', `✓ MAPI accepted (non-standard response)`);
+          }
+        } catch (err: any) {
+          this.log('SPLIT', `MAPI error (attempt ${attempt + 1}): ${err.message}`);
+          if (attempt < 2) await new Promise(r => setTimeout(r, 200));
+        }
+      }
     }
 
-    if (!arcOk && !wocOk) {
-      // Last resort: check if tx is already on-chain. Retry with backoff —
-      // WoC often 429s during multi-container startup.
+    // ARC fallback (only if MAPI not configured or failed)
+    if (!broadcastOk) {
+      try {
+        const result = await tx.broadcast(this.arc);
+        if ('status' in result && result.status === 'error') {
+          const fail = result as any;
+          const desc = (fail.description || '').toLowerCase();
+          if (desc.includes('seen on network') || desc.includes('already mined') || desc.includes('already known')) {
+            this.log('SPLIT', `ARC reports tx already on network — treating as success`);
+            broadcastOk = true;
+          } else {
+            this.log('SPLIT', `ARC error: code=${fail.code} desc=${fail.description}`);
+          }
+        } else {
+          broadcastOk = true;
+        }
+      } catch (arcErr: any) {
+        this.log('SPLIT', `ARC exception: ${arcErr.message}`);
+      }
+    }
+
+    // WoC fallback
+    if (!broadcastOk) {
+      const wocOk = await this.wocBroadcast(txHex);
+      this.log('SPLIT', `WoC broadcast: ${wocOk ? 'OK' : 'FAILED'}`);
+      broadcastOk = wocOk;
+    }
+
+    if (!broadcastOk) {
+      // Last resort: check if tx is already on-chain
       let found = false;
       for (let retry = 0; retry < 3 && !found; retry++) {
         if (retry > 0) await new Promise(r => setTimeout(r, 2000 * retry));
@@ -560,33 +695,35 @@ export class DirectBroadcastEngine {
           if (checkResp.ok) {
             this.log('SPLIT', `Tx ${txid.slice(0, 16)}... already on-chain — proceeding`);
             found = true;
+            broadcastOk = true;
           }
         } catch {}
       }
       if (!found) {
-        throw new Error(`Split broadcast failed on both ARC and WoC. txid=${txid}`);
+        throw new Error(`Split broadcast failed on MAPI, ARC, and WoC. txid=${txid}`);
       }
     }
 
-    // Verify tx is visible on WoC (propagation sanity check)
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const check = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`);
-        if (check.ok && (await check.text()).length > 100) {
-          this.log('SPLIT', `✓ WoC sees tx: ${txid}`);
-          break;
-        }
-      } catch {}
-      this.log('SPLIT', `Waiting for WoC propagation... (attempt ${attempt + 1}/5)`);
-      await new Promise(r => setTimeout(r, 2000));
+    // Skip slow WoC propagation checks and ARC wait when using MAPI —
+    // MAPI goes direct to miner mempool, no propagation delay needed
+    if (!useMapi) {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          const check = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`);
+          if (check.ok && (await check.text()).length > 100) {
+            this.log('SPLIT', `✓ WoC sees tx: ${txid}`);
+            break;
+          }
+        } catch {}
+        this.log('SPLIT', `Waiting for WoC propagation... (attempt ${attempt + 1}/5)`);
+        await new Promise(r => setTimeout(r, 2000));
+      }
+      await this.waitForArcSeen(txid, 60_000);
     }
 
-    // CRITICAL: Wait for ARC to fully ingest the fan-out before streaming
-    // children to it. If ARC doesn't know the parent, children land in
-    // SEEN_IN_ORPHAN_MEMPOOL and never get mined.
-    await this.waitForArcSeen(txid, 60_000);
-
     this.logTxid(txid, 'split', funding.satoshis, fee, txHex.length / 2);
+    // Merge into BEEF store — the fan-out tx + its parent are now in the envelope
+    if (this.beefStore) this.beefStore.mergeTransaction(tx);
     this.log('SPLIT', `✓ Fan-out tx: ${txid} (${splits} outputs)`);
     this.log('SPLIT', `  https://whatsonchain.com/tx/${txid}`);
 
@@ -615,31 +752,76 @@ export class DirectBroadcastEngine {
    */
   async discoverUtxos(partitionIndex?: number, totalPartitions?: number): Promise<{ count: number; totalSats: number }> {
     const address = this.getFundingAddress();
-    this.log('DISCOVER', `Fetching UTXOs for ${address}...`);
+    const useMapi = process.env.BROADCAST_VIA === 'mapi' || !!process.env.MAPI_URL;
+    this.log('DISCOVER', `Fetching UTXOs for ${address} via ${useMapi ? 'Bitails' : 'WoC'}...`);
 
-    const resp = await fetch(
-      `https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`,
-    );
-    if (!resp.ok) throw new Error(`WoC returned ${resp.status}`);
+    let allUtxoRaw: Array<{ txid: string; vout: number; sats: number }> = [];
 
-    const utxos: any[] = await resp.json();
-    if (utxos.length === 0) throw new Error('No UTXOs found on-chain');
+    if (useMapi) {
+      // Use Bitails for paginated, fresh UTXO discovery (includes unconfirmed)
+      let from = 0;
+      while (true) {
+        const resp = await fetch(`https://api.bitails.io/address/${address}/unspent?limit=10000&from=${from}`);
+        if (!resp.ok) { this.log('DISCOVER', `Bitails HTTP ${resp.status}`); break; }
+        const data: any = await resp.json();
+        const list = data.unspent ?? data;
+        if (!Array.isArray(list) || list.length === 0) break;
+        for (const u of list) {
+          const sats = u.value ?? u.satoshis ?? 0;
+          const txid = u.tx_hash ?? u.txid;
+          const vout = u.tx_pos ?? u.vout;
+          if (sats > 0 && txid) allUtxoRaw.push({ txid, vout, sats });
+        }
+        this.log('DISCOVER', `  Bitails page: ${list.length} UTXOs (${allUtxoRaw.length} total)`);
+        if (list.length < 10000) break;
+        from += 10000;
+      }
+    } else {
+      const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`);
+      if (!resp.ok) throw new Error(`WoC returned ${resp.status}`);
+      const utxos: any[] = await resp.json();
+      for (const u of utxos) {
+        allUtxoRaw.push({ txid: u.tx_hash, vout: u.tx_pos, sats: u.value });
+      }
+    }
+
+    if (allUtxoRaw.length === 0) throw new Error('No UTXOs found on-chain');
 
     // Filter out dust that can't cover a CellToken fee
-    const MIN_USEFUL = this.config.minFee + 2;
-    let usable = utxos.filter(u => u.value >= MIN_USEFUL);
+    const estFee = Math.max(this.config.minFee, Math.ceil(1345 * this.config.feeRate));
+    const MIN_USEFUL = estFee + 2;
+    let usable = allUtxoRaw.filter(u => u.sats >= MIN_USEFUL);
 
     // If partitioned, take only our slice (deterministic split by index)
     if (partitionIndex !== undefined && totalPartitions !== undefined && totalPartitions > 1) {
       usable = usable.filter((_, i) => i % totalPartitions === partitionIndex);
-      this.log('DISCOVER', `Partition ${partitionIndex}/${totalPartitions}: taking ${usable.length} of ${utxos.length} UTXOs`);
+      this.log('DISCOVER', `Partition ${partitionIndex}/${totalPartitions}: taking ${usable.length} of ${allUtxoRaw.length} UTXOs`);
     }
-    const totalSats = usable.reduce((s, u) => s + u.value, 0);
+    const totalSats = usable.reduce((s, u) => s + u.sats, 0);
+    this.log('DISCOVER', `Found ${usable.length} usable UTXOs (${totalSats.toLocaleString()} sats), discarded ${allUtxoRaw.length - usable.length} dust (min ${MIN_USEFUL} sats)`);
 
-    this.log('DISCOVER', `Found ${usable.length} usable UTXOs (${totalSats.toLocaleString()} sats), discarded ${utxos.length - usable.length} dust`);
+    if (useMapi) {
+      // MAPI mode: no source tx needed — P2PKH.unlock with explicit sats + lockScript
+      const p2pkh = new P2PKH();
+      const lockScript = p2pkh.lock(address);
+      const fundingUtxos: FundingUtxo[] = usable.map(u => ({
+        txid: u.txid,
+        vout: u.vout,
+        satoshis: u.sats,
+        sourceTx: undefined as any, // MAPI doesn't need EF; we use offline signing
+      }));
 
-    // Fetch unique source txs (many UTXOs share the same parent tx)
-    const uniqueTxids = [...new Set(usable.map(u => u.tx_hash))];
+      this.utxoPools = Array.from({ length: this.config.streams }, () => []);
+      for (let i = 0; i < fundingUtxos.length; i++) {
+        this.utxoPools[i % this.config.streams].push(fundingUtxos[i]);
+      }
+      this.chainTipDirty = true;
+      this.log('DISCOVER', `Partitioned ${fundingUtxos.length} UTXOs: ${this.utxoPools.map((p, i) => `stream${i}=${p.length}`).join(', ')}`);
+      return { count: fundingUtxos.length, totalSats };
+    }
+
+    // Non-MAPI: fetch source txs (needed for EF format)
+    const uniqueTxids = [...new Set(usable.map(u => u.txid))];
     this.log('DISCOVER', `Need ${uniqueTxids.length} unique source txs for ${usable.length} UTXOs`);
 
     const txCache = new Map<string, Transaction>();
@@ -663,21 +845,14 @@ export class DirectBroadcastEngine {
     }
     this.log('DISCOVER', `Fetched ${txCache.size}/${uniqueTxids.length} source txs`);
 
-    // Build funding UTXOs from cache
     const fundingUtxos: FundingUtxo[] = [];
     for (const u of usable) {
-      const sourceTx = txCache.get(u.tx_hash);
+      const sourceTx = txCache.get(u.txid);
       if (sourceTx) {
-        fundingUtxos.push({
-          txid: u.tx_hash as string,
-          vout: u.tx_pos as number,
-          satoshis: u.value as number,
-          sourceTx,
-        });
+        fundingUtxos.push({ txid: u.txid, vout: u.vout, satoshis: u.sats, sourceTx });
       }
     }
 
-    // Partition across streams
     this.utxoPools = Array.from({ length: this.config.streams }, () => []);
     for (let i = 0; i < fundingUtxos.length; i++) {
       this.utxoPools[i % this.config.streams].push(fundingUtxos[i]);
@@ -717,12 +892,23 @@ export class DirectBroadcastEngine {
     const tx = new Transaction();
 
     // Input: funding UTXO
-    tx.addInput({
-      sourceTXID: funding.txid,
-      sourceOutputIndex: funding.vout,
-      sourceTransaction: funding.sourceTx,
-      unlockingScriptTemplate: p2pkh.unlock(this.privateKey),
-    });
+    // When sourceTx is available, SDK can extract sats/lock from it.
+    // When sourceTx is undefined (MAPI discover mode), use offline signing with explicit sats + lock.
+    const fundingLock = p2pkh.lock(this.publicKey.toAddress());
+    if (funding.sourceTx) {
+      tx.addInput({
+        sourceTXID: funding.txid,
+        sourceOutputIndex: funding.vout,
+        sourceTransaction: funding.sourceTx,
+        unlockingScriptTemplate: p2pkh.unlock(this.privateKey),
+      });
+    } else {
+      tx.addInput({
+        sourceTXID: funding.txid,
+        sourceOutputIndex: funding.vout,
+        unlockingScriptTemplate: p2pkh.unlock(this.privateKey, 'all', false, funding.satoshis, fundingLock),
+      });
+    }
 
     // Output 0: CellToken (1 sat)
     tx.addOutput({
@@ -734,7 +920,7 @@ export class DirectBroadcastEngine {
     // CellToken locking script ≈ 1,142 bytes (256 header + 768 payload + ~40 path + 32 hash + 34 pubkey + opcodes)
     // CellToken output = 8 (value) + 3 (varint) + 1,142 (script) ≈ 1,153 bytes
     // Total: 10 (overhead) + 148 (P2PKH input) + 1,153 (CellToken output) + 34 (P2PKH change) ≈ 1,345 bytes
-    const changeLock = p2pkh.lock(this.publicKey.toAddress());
+    const changeLock = fundingLock;
     const estTxBytes = 10 + 148 + 1153 + 34; // overhead + P2PKH input + CellToken output + P2PKH change
     const fee = Math.max(this.config.minFee, Math.ceil(estTxBytes * this.config.feeRate));
     const change = funding.satoshis - this.config.cellSatoshis - fee;
@@ -751,6 +937,9 @@ export class DirectBroadcastEngine {
     const txid = tx.id('hex') as string;
     this.logTxid(txid, 'celltoken', funding.satoshis, fee, estTxBytes);
     const { broadcastMs } = await this.broadcastTx(tx, 'CellToken');
+
+    // Merge into BEEF store — CellToken tx with its parent ancestry
+    if (this.beefStore) this.beefStore.mergeTransaction(tx);
 
     // Recycle change output back into the pool
     if (change > 0) {
@@ -851,12 +1040,21 @@ export class DirectBroadcastEngine {
     });
 
     // Input 1: funding UTXO to pay miner fee
-    tx.addInput({
-      sourceTXID: funding.txid,
-      sourceOutputIndex: funding.vout,
-      sourceTransaction: funding.sourceTx,
-      unlockingScriptTemplate: p2pkh.unlock(this.privateKey),
-    });
+    const fundingLockT = p2pkh.lock(this.publicKey.toAddress());
+    if (funding.sourceTx) {
+      tx.addInput({
+        sourceTXID: funding.txid,
+        sourceOutputIndex: funding.vout,
+        sourceTransaction: funding.sourceTx,
+        unlockingScriptTemplate: p2pkh.unlock(this.privateKey),
+      });
+    } else {
+      tx.addInput({
+        sourceTXID: funding.txid,
+        sourceOutputIndex: funding.vout,
+        unlockingScriptTemplate: p2pkh.unlock(this.privateKey, 'all', false, funding.satoshis, fundingLockT),
+      });
+    }
 
     // Output 0: new CellToken (1 sat)
     tx.addOutput({
@@ -884,6 +1082,9 @@ export class DirectBroadcastEngine {
     const txid = tx.id('hex') as string;
     this.logTxid(txid, 'transition', totalIn, fee, estTransitionBytes);
     const { broadcastMs } = await this.broadcastTx(tx, 'Transition');
+
+    // Merge into BEEF store — transition tx with full ancestry
+    if (this.beefStore) this.beefStore.mergeTransaction(tx);
 
     // Recycle change output back into the pool
     if (change > 0) {
@@ -929,12 +1130,21 @@ export class DirectBroadcastEngine {
     const tx = new Transaction();
 
     // Input
-    tx.addInput({
-      sourceTXID: funding.txid,
-      sourceOutputIndex: funding.vout,
-      sourceTransaction: funding.sourceTx,
-      unlockingScriptTemplate: p2pkh.unlock(this.privateKey),
-    });
+    const fundingLockR = p2pkh.lock(this.publicKey.toAddress());
+    if (funding.sourceTx) {
+      tx.addInput({
+        sourceTXID: funding.txid,
+        sourceOutputIndex: funding.vout,
+        sourceTransaction: funding.sourceTx,
+        unlockingScriptTemplate: p2pkh.unlock(this.privateKey),
+      });
+    } else {
+      tx.addInput({
+        sourceTXID: funding.txid,
+        sourceOutputIndex: funding.vout,
+        unlockingScriptTemplate: p2pkh.unlock(this.privateKey, 'all', false, funding.satoshis, fundingLockR),
+      });
+    }
 
     // Output 0: OP_RETURN (0 sats)
     tx.addOutput({
@@ -959,6 +1169,9 @@ export class DirectBroadcastEngine {
 
     const txid = tx.id('hex') as string;
     const { broadcastMs } = await this.broadcastTx(tx, 'OP_RETURN');
+
+    // Merge into BEEF store
+    if (this.beefStore) this.beefStore.mergeTransaction(tx);
 
     // Recycle change
     if (change > 0) {
@@ -1151,6 +1364,8 @@ export class DirectBroadcastEngine {
     // After all broadcasts settle, snapshot the chain tip so the next boot
     // restores from a known-good state.
     this.finalizeChainTipPersistence();
+    // Also flush BEEF store if active
+    if (this.beefStore) this.beefStore.shutdown();
     return { settled, errors };
   }
 
@@ -1160,6 +1375,12 @@ export class DirectBroadcastEngine {
    * of BATCH_SIZE via ARC's /v1/txs bulk endpoint (one HTTP round-trip per batch).
    */
   private async broadcastTx(tx: Transaction, label: string): Promise<{ broadcastMs: number }> {
+    // MAPI mode — direct to GorillaPool mining node (proven 100% on-chain rate)
+    const useMapi = process.env.BROADCAST_VIA === 'mapi' || process.env.MAPI_URL;
+    if (useMapi) {
+      return this.broadcastViaMapi(tx, label);
+    }
+
     if (this.config.fireAndForget) {
       // Batch mode — accumulate and flush in bursts
       this.batchQueue.push(tx);
@@ -1191,6 +1412,67 @@ export class DirectBroadcastEngine {
       this.totalBroadcastMs += broadcastMs;
       return { broadcastMs };
     }
+  }
+
+  /**
+   * Broadcast via GorillaPool MAPI — direct to miner's mempool.
+   * Unlike ARC (which just announces to peers and hopes), MAPI puts txs
+   * directly in the mining node's mempool. Proven 100% on-chain rate.
+   */
+  private async broadcastViaMapi(tx: Transaction, label: string): Promise<{ broadcastMs: number }> {
+    const mapiUrl = process.env.MAPI_URL ?? 'https://mapi.gorillapool.io/mapi/tx';
+    const txHex = tx.toHex();
+    const t1 = Date.now();
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const resp = await fetch(mapiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rawtx: txHex }),
+        });
+
+        if (resp.status === 429) {
+          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+          continue;
+        }
+
+        const raw = await resp.text();
+        const broadcastMs = Date.now() - t1;
+
+        try {
+          const outer = JSON.parse(raw);
+          const inner = JSON.parse(outer.payload);
+          const ok = inner.returnResult === 'success'
+            || (inner.resultDescription || '').includes('already known');
+
+          if (!ok) {
+            const err = `${label} MAPI rejected: ${inner.resultDescription}`;
+            this.errors.push(err);
+            throw new Error(err);
+          }
+        } catch (parseErr: any) {
+          if (parseErr.message.includes('MAPI rejected')) throw parseErr;
+          // If we can't parse but HTTP was ok, assume success
+          if (!resp.ok) {
+            const err = `${label} MAPI HTTP ${resp.status}: ${raw.slice(0, 200)}`;
+            this.errors.push(err);
+            throw new Error(err);
+          }
+        }
+
+        this.totalBroadcast++;
+        this.totalBroadcastMs += broadcastMs;
+        return { broadcastMs };
+      } catch (err: any) {
+        if (err.message.includes('MAPI rejected') || err.message.includes('MAPI HTTP')) throw err;
+        if (attempt < 2) { await new Promise(r => setTimeout(r, 200)); continue; }
+        const errMsg = `${label} MAPI error: ${err.message}`;
+        this.errors.push(errMsg);
+        throw new Error(errMsg);
+      }
+    }
+    throw new Error(`${label} MAPI: 429 after 3 retries`);
   }
 
   /**

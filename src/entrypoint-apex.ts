@@ -173,6 +173,9 @@ async function initBroadcastEngine(): Promise<void> {
   // Chain-tip persistence — restart-safe. See entrypoint-floor.ts for rationale.
   broadcastEngine.enableChainTipPersistence(`${logDir}/chaintip-apex-${APEX_INDEX}.json`);
 
+  // BEEF store: BRC-62 binary envelopes for proper UTXO ancestry tracking.
+  broadcastEngine.enableBeefStore(`${logDir}/chain-apex-${APEX_INDEX}.beef`);
+
   const addr = broadcastEngine.getFundingAddress();
   const { readFileSync, existsSync } = await import('fs');
   const fundingTxHex = process.env.FUNDING_TX_HEX
@@ -186,11 +189,18 @@ async function initBroadcastEngine(): Promise<void> {
   console.log(`[${APEX_ID}] Broadcast engine address: ${addr}`);
   if (changeAddr) console.log(`[${APEX_ID}] Change sweep to: ${changeAddr}`);
 
-  // Prefer restart-safe chaintip snapshot over re-ingesting the fan-out vout.
-  const restored = await broadcastEngine.restoreChainTip();
+  // Priority: BEEF store → JSON chaintip → fresh funding
+  let restored = await broadcastEngine.restoreFromBeef();
   if (restored) {
-    console.log(`[${APEX_ID}] Restored from chaintip snapshot — skipping preSplit`);
-  } else if (fundingTxHex) {
+    console.log(`[${APEX_ID}] Restored from BEEF store — skipping preSplit`);
+  }
+  if (!restored) {
+    restored = await broadcastEngine.restoreChainTip();
+    if (restored) {
+      console.log(`[${APEX_ID}] Restored from JSON chaintip snapshot — skipping preSplit`);
+    }
+  }
+  if (!restored && fundingTxHex) {
     // Pre-funded by pre-fund.ts — ingest our assigned UTXO directly
     console.log(`[${APEX_ID}] Ingesting pre-funded UTXO (vout ${fundingVout})...`);
     const funding = await broadcastEngine.ingestFunding(fundingTxHex, fundingVout);

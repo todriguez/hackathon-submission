@@ -2,5 +2,19 @@ node_modules/
 dist/
 .env
 .env.live
+.env.fleet
+.env.fresh
+docker-compose.override.yml
 *.csv
 bun.lock
+# Runtime data (contains WIFs and large hex blobs)
+data/*.hex
+data/*.beef
+data/*.log
+data/*.json
+# Audit runtime state (large, ephemeral)
+audit/chaintip-*.json
+audit/chain-*.beef
+audit/archive-*/chaintip-*.json
+# Claude session state
+.claude/scheduled_tasks.lock
